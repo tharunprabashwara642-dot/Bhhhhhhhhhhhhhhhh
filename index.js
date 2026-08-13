@@ -17,6 +17,7 @@
 //   GEMINI_API_KEYS            (optional — comma-separated list of keys to
 //                               rotate through automatically when one hits
 //                               its quota, e.g. "keyA,keyB,keyC")
+//   GEMINI_TEXT_MODEL          (optional — override the default model, e.g. "gemini-1.5-pro")
 //
 // NEW — schedule_reminder needs two extra columns on scheduled_tasks (this
 // table already existed for schedule_research). Run this once in the
@@ -407,10 +408,11 @@ async function fetchGeminiRotating(urlBuilder, options) {
   throw lastErr || new Error("All Gemini API keys failed");
 }
 
-// Confirm this matches a text-capable Gemini model on your AI Studio account.
-const GEMINI_TEXT_MODEL = "gemini-2.0-flash-exp"; // Updated to latest
+// FIXED: Using correct Gemini model name - gemini-1.5-flash (production stable)
+// Can be overridden with GEMINI_TEXT_MODEL environment variable
+const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-1.5-flash";
 const GEMINI_EMBEDDING_MODEL = "text-embedding-004";
-const TIMEZONE = "Asia/Colombo"; // fixed regardless of the server's own timezone
+const TIMEZONE = "Asia/Colombo";
 
 function nowInTimezone() {
   const now = new Date();
