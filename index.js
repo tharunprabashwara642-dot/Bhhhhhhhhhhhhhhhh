@@ -1,57 +1,75 @@
-// Night Agent Tasks Bot — standalone project
-//
-// Two things happen in this bot:
-// 1. Step-by-step goal check-ins (unchanged from before) — when a goal_step
-//    is awaiting_approval and you reply "ok"/"skip".
-// 2. NEW: general text chat — any other message you send gets a real
-//    reply from Gemini, using the same memory (agent_memories) and the
-//    same tools (save_memory, create_task_list) as the orb app. So you can
-//    now talk to Night Agent directly through Telegram, not just the orb.
-//
-// Required environment variables (set these in Railway, never in code):
-//   TELEGRAM_BOT_TOKEN         (from BotFather)
-//   SUPABASE_URL               (Project Settings > API)
-//   SUPABASE_SERVICE_ROLE_KEY  (Project Settings > API > service_role key)
-//   NIGHT_AGENT_CHAT_ID        (your personal Telegram chat id)
-//   GEMINI_API_KEY             (same key as the orb app, from AI Studio)
-//   GEMINI_API_KEYS            (optional — comma-separated list of keys to
-//                               rotate through automatically when one hits
-//                               its quota, e.g. "keyA,keyB,keyC")
-//   GEMINI_TEXT_MODEL          (optional — override the default model, e.g. "gemini-1.5-pro")
-//
-// NEW — schedule_reminder needs two extra columns on scheduled_tasks (this
-// table already existed for schedule_research). Run this once in the
-// Supabase SQL editor:
-//
-//   alter table scheduled_tasks add column if not exists kind text not null default 'research';
-//   alter table scheduled_tasks add column if not exists message text;
-//
-// NEW tools added: web_search (live search during chat/autonomous review),
-// schedule_reminder (plain timed message, no research), create_calendar_event
-// (write access — needs a Google refresh token with calendar write scope,
-// not just calendar.readonly).
-
+// Night // Night Agent Tasks Bot — standalone project
 const TelegramBot = require("node-telegram-bot-api");
 const { createClient } = require("@supabase/supabase-js");
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-const CHAT_ID = process.env.NIGHT_AGENT_CHAT_ID;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// ============================================================
+// ERROR HANDLING — catch everything so bot doesn't crash
+// ============================================================
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+});
+
+process.on('SIGTERM', () => {
+  console.log('⚠️ Received SIGTERM signal');
+  if (bot) {
+    try { bot.stopPolling(); } catch(e) {}
+  }
+  process.exit(0);
+});
 
 // ============================================================
-// Multi-key rotation — set GEMINI_API_KEYS as a comma-separated list of
-// 2+ keys (e.g. from different Google accounts/AI Studio projects) to
-// multiply your effective free-tier rate limit. Falls back to the single
-// GEMINI_API_KEY above if GEMINI_API_KEYS isn't set.
+// CONFIGURATION
+// ============================================================
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const CHAT_ID = process.env.NIGHT_AGENT_CHAT_ID;
+
+if (!TELEGRAM_BOT_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !CHAT_ID) {
+  console.error('❌ Missing required environment variables!');
+  process.exit(1);
+}
+
+let bot;
+try {
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { 
+    polling: {
+      interval: 300,
+      autoStart: true,
+      params: {
+        timeout: 10
+      }
+    }
+  });
+} catch (error) {
+  console.error('❌ Failed to initialize bot:', error);
+  process.exit(1);
+}
+
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ============================================================
+// GEMINI API KEYS ROTATION
 // ============================================================
 const API_KEYS = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
   .split(",")
   .map((k) => k.trim())
   .filter(Boolean);
+
+if (API_KEYS.length === 0) {
+  console.error('❌ No Gemini API keys configured!');
+  process.exit(1);
+}
+
+console.log(`✅ Loaded ${API_KEYS.length} Gemini API keys`);
+
 let keyCursor = 0;
 function nextKey() {
   if (API_KEYS.length === 0) return null;
@@ -63,10 +81,7 @@ function nextKey() {
 }
 
 // ============================================================
-// Google Calendar (read-only)
-// Requires GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-// in Railway. If any are missing, calendar tools quietly report themselves
-// as unavailable instead of erroring.
+// GOOGLE OAUTH
 // ============================================================
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -78,7 +93,7 @@ let cachedGoogleAccessTokenExpiry = 0;
 
 async function getGoogleAccessToken() {
   if (!GOOGLE_CONFIGURED) {
-    throw new Error('Google OAuth credentials missing - check GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN');
+    throw new Error('Google OAuth credentials missing');
   }
 
   if (cachedGoogleAccessToken && Date.now() < cachedGoogleAccessTokenExpiry - 60000) {
@@ -99,29 +114,22 @@ async function getGoogleAccessToken() {
     
     const data = await res.json();
     
-    // Enhanced error logging
     if (data.error) {
-      console.error('❌ Google OAuth Error Details:', JSON.stringify(data, null, 2));
+      console.error('❌ Google OAuth Error:', JSON.stringify(data, null, 2));
       let errorMsg = `Google API error: ${data.error}`;
       if (data.error_description) {
         errorMsg += ` - ${data.error_description}`;
-      }
-      // Common root causes
-      if (data.error === 'invalid_grant') {
-        errorMsg += ' (Possible causes: refresh token expired, revoked, or generated with different client credentials)';
-      } else if (data.error === 'invalid_client') {
-        errorMsg += ' (Client ID or secret doesn\'t match the refresh token)';
       }
       throw new Error(errorMsg);
     }
     
     if (!data.access_token) {
-      throw new Error('No access_token in Google response - check client credentials');
+      throw new Error('No access_token in response');
     }
     
     cachedGoogleAccessToken = data.access_token;
     cachedGoogleAccessTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
-    console.log('✅ Google token refreshed successfully');
+    console.log('✅ Google token refreshed');
     return cachedGoogleAccessToken;
   } catch (error) {
     console.error('❌ Google token refresh failed:', error.message);
@@ -130,11 +138,10 @@ async function getGoogleAccessToken() {
 }
 
 // ============================================================
-// NEW GOOGLE API TOOLS
+// GOOGLE API TOOLS
 // ============================================================
-
 async function getDriveFiles(maxResults = 10, query = "") {
-  if (!GOOGLE_CONFIGURED) return { files: [], reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { files: [], reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const q = query || "mimeType != 'application/vnd.google-apps.folder'";
@@ -157,7 +164,7 @@ async function getDriveFiles(maxResults = 10, query = "") {
 }
 
 async function getSheetData(spreadsheetId, range) {
-  if (!GOOGLE_CONFIGURED) return { values: [], reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { values: [], reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}`;
@@ -177,7 +184,7 @@ async function getSheetData(spreadsheetId, range) {
 }
 
 async function getDocContent(documentId) {
-  if (!GOOGLE_CONFIGURED) return { content: "", reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { content: "", reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const url = `https://docs.googleapis.com/v1/documents/${documentId}`;
@@ -185,7 +192,6 @@ async function getDocContent(documentId) {
     const data = await res.json();
     if (data.error) throw new Error(data.error.message);
     
-    // Extract text content from document structure
     let content = "";
     if (data.body?.content) {
       for (const element of data.body.content) {
@@ -210,7 +216,7 @@ async function getDocContent(documentId) {
 }
 
 async function getContacts(query = "", maxResults = 10) {
-  if (!GOOGLE_CONFIGURED) return { contacts: [], reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { contacts: [], reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const params = new URLSearchParams({
@@ -236,11 +242,10 @@ async function getContacts(query = "", maxResults = 10) {
 }
 
 async function getYouTubeAnalytics(channelId = null) {
-  if (!GOOGLE_CONFIGURED) return { stats: {}, reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { stats: {}, reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     
-    // First get channel info
     let channelUrl = 'https://youtube.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true';
     if (channelId) {
       channelUrl = `https://youtube.googleapis.com/youtube/v3/channels?part=snippet,statistics&id=${channelId}`;
@@ -252,7 +257,6 @@ async function getYouTubeAnalytics(channelId = null) {
     const channel = channelData.items?.[0];
     if (!channel) throw new Error('YouTube channel not found');
     
-    // Get analytics for last 30 days
     const today = new Date();
     const thirtyDaysAgo = new Date(today.getTime() - 30 * 86400000);
     const endDate = today.toISOString().split('T')[0];
@@ -263,7 +267,6 @@ async function getYouTubeAnalytics(channelId = null) {
     const analyticsData = await analyticsRes.json();
     if (analyticsData.error) throw new Error(analyticsData.error.message);
     
-    // Get recent videos
     const videosUrl = `https://youtube.googleapis.com/youtube/v3/search?channelId=${channel.id}&part=snippet&order=date&maxResults=5`;
     const videosRes = await fetch(videosUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
     const videosData = await videosRes.json();
@@ -298,12 +301,8 @@ async function getYouTubeAnalytics(channelId = null) {
   }
 }
 
-// ============================================================
-// Original Google API functions
-// ============================================================
-
 async function getCalendarEvents(daysAhead = 7) {
-  if (!GOOGLE_CONFIGURED) return { events: [], reason: "Google Calendar not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { events: [], reason: "Google Calendar not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const timeMin = new Date().toISOString();
@@ -326,7 +325,7 @@ async function getCalendarEvents(daysAhead = 7) {
 }
 
 async function getGmailSummary(maxResults = 10, query = "is:unread") {
-  if (!GOOGLE_CONFIGURED) return { emails: [], reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { emails: [], reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const listRes = await fetch(
@@ -359,7 +358,7 @@ function base64UrlEncode(str) {
 }
 
 async function sendGmail(to, subject, body) {
-  if (!GOOGLE_CONFIGURED) return { sent: false, reason: "Google not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { sent: false, reason: "Google not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const rawMessage = [`To: ${to}`, `Subject: ${subject}`, "Content-Type: text/plain; charset=utf-8", "", body].join("\n");
@@ -378,25 +377,25 @@ async function sendGmail(to, subject, body) {
   }
 }
 
-// Tries each configured key in turn. On a 429 (rate limited) it moves to
-// the next key immediately (no wait — a different key has its own quota).
-// On a 5xx it also rotates+retries. Only throws once every key has failed.
+// ============================================================
+// GEMINI HELPER FUNCTIONS
+// ============================================================
 async function fetchGeminiRotating(urlBuilder, options) {
   const attempts = Math.max(API_KEYS.length, 1);
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     const key = nextKey();
-    if (!key) throw new Error("No Gemini API key configured (set GEMINI_API_KEY or GEMINI_API_KEYS)");
+    if (!key) throw new Error("No Gemini API key configured");
     try {
       const res = await fetch(urlBuilder(key), options);
       const data = await res.json();
       if (res.status === 429) {
-        console.error(`⚠️ Key index ${keyCursor - 1} (****${key.slice(-4)}) rate-limited (429), rotating to next key`);
-        lastErr = new Error("All available keys are rate limited right now");
+        console.error(`⚠️ Key index ${keyCursor - 1} (****${key.slice(-4)}) rate-limited`);
+        lastErr = new Error("Rate limited");
         continue;
       }
       if (!res.ok && res.status >= 500) {
-        console.error(`⚠️ Key index ${keyCursor - 1} (****${key.slice(-4)}) server error ${res.status}, rotating`);
+        console.error(`⚠️ Key index ${keyCursor - 1} (****${key.slice(-4)}) server error ${res.status}`);
         lastErr = new Error(data.error?.message || `HTTP ${res.status}`);
         continue;
       }
@@ -408,8 +407,7 @@ async function fetchGeminiRotating(urlBuilder, options) {
   throw lastErr || new Error("All Gemini API keys failed");
 }
 
-// FIXED: Using correct Gemini model name - gemini-1.5-flash (production stable)
-// Can be overridden with GEMINI_TEXT_MODEL environment variable
+// FIXED: Correct model name
 const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-1.5-flash";
 const GEMINI_EMBEDDING_MODEL = "text-embedding-004";
 const TIMEZONE = "Asia/Colombo";
@@ -421,8 +419,6 @@ function nowInTimezone() {
     weekday: "long", year: "numeric", month: "long", day: "numeric",
     hour: "2-digit", minute: "2-digit",
   });
-  // build an ISO string that carries the Colombo offset explicitly, so it's
-  // unambiguous no matter what timezone Postgres/Node/Railway default to
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
@@ -431,261 +427,35 @@ function nowInTimezone() {
   return { iso: isoWithOffset, readable, timezone: TIMEZONE };
 }
 
-const YES_WORDS = ["ok", "okay", "yes", "done", "start", "ඔව්", "හරි", "කලා"];
-const SKIP_WORDS = ["skip", "no", "later", "එපා", "පස්සේ"];
-
 // ============================================================
-// PART 0 — self-correction / error recovery helpers
-// ============================================================
-async function withRetry(fn, { retries = 2, delayMs = 800, label = "operation" } = {}) {
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (e) {
-      lastErr = e;
-      console.error(`⚠️ ${label} failed (attempt ${attempt + 1}/${retries + 1}): ${e.message}`);
-      if (attempt < retries) await new Promise((r) => setTimeout(r, delayMs * (attempt + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-// Catch anything that slips past local try/catch so the bot never dies
-// silently. Railway restarts the container anyway on exit, but we notify
-// first so you know something crashed instead of just going quiet.
-process.on("unhandledRejection", async (reason) => {
-  console.error("⚠️ Unhandled rejection:", reason);
-  try { await bot.sendMessage(CHAT_ID, `⚠️ Background error (recovered): ${String(reason).slice(0, 300)}`); } catch (e) {}
-});
-process.on("uncaughtException", async (err) => {
-  console.error("⚠️ Uncaught exception:", err);
-  try { await bot.sendMessage(CHAT_ID, `⚠️ Bot crashed and is restarting: ${err.message}`); } catch (e) {}
-  setTimeout(() => process.exit(1), 1500); // let the message send, then let Railway restart us
-});
-
-console.log("Night Agent Tasks Bot started.");
-
-// ============================================================
-// PART 1 — step-by-step goal check-ins (unchanged behavior)
-// ============================================================
-setInterval(checkAndSendNextStep, 30000);
-checkAndSendNextStep();
-
-async function checkAndSendNextStep() {
-  const { data: alreadyWaiting } = await supabase
-    .from("goal_steps")
-    .select("id")
-    .eq("status", "awaiting_approval")
-    .limit(1)
-    .maybeSingle();
-  if (alreadyWaiting) return;
-
-  const { data: nextStep } = await supabase
-    .from("goal_steps")
-    .select("*, goals!inner(status, title)")
-    .eq("status", "pending")
-    .eq("goals.status", "active")
-    .order("goal_id", { ascending: true })
-    .order("step_number", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-
-  if (!nextStep) return;
-
-  await supabase.from("goal_steps").update({ status: "awaiting_approval" }).eq("id", nextStep.id);
-  await bot.sendMessage(
-    CHAT_ID,
-    `🌙 "${nextStep.goals.title}" — step ${nextStep.step_number}:\n${nextStep.description}\n\nReply "ok" when done, or "skip" to skip this step.`
-  );
-}
-
-async function maybeCompleteGoal(goalId, title) {
-  const { data: remaining } = await supabase
-    .from("goal_steps")
-    .select("id")
-    .eq("goal_id", goalId)
-    .eq("status", "pending");
-
-  if (remaining && remaining.length === 0) {
-    await supabase.from("goals").update({ status: "done" }).eq("id", goalId);
-    await bot.sendMessage(CHAT_ID, `🎉 All steps done for "${title}"!`);
-  }
-}
-
-// ============================================================
-// PART 1b — scheduled research tasks
-// ============================================================
-setInterval(checkScheduledResearch, 60000);
-
-// ============================================================
-// PART 1c — outbox (lets the voice orb app relay a message here,
-// since it can't hold the Telegram bot token itself)
-// ============================================================
-setInterval(checkOutbox, 15000);
-
-async function checkOutbox() {
-  const { data: pending } = await supabase
-    .from("outbox_messages")
-    .select("*")
-    .eq("status", "pending")
-    .order("created_at", { ascending: true })
-    .limit(5);
-
-  if (!pending || pending.length === 0) return;
-
-  for (const msg of pending) {
-    try {
-      await bot.sendMessage(CHAT_ID, msg.content);
-      await logBotMessage("agent", msg.content);
-      await supabase.from("outbox_messages").update({ status: "sent" }).eq("id", msg.id);
-    } catch (e) {
-      console.error("checkOutbox send failed:", e.message);
-    }
-  }
-}
-checkScheduledResearch();
-
-async function checkScheduledResearch() {
-  const nowIso = new Date().toISOString();
-  const { data: dueTasks } = await supabase
-    .from("scheduled_tasks")
-    .select("*")
-    .eq("status", "pending")
-    .lte("run_at", nowIso)
-    .order("run_at", { ascending: true })
-    .limit(3);
-
-  if (!dueTasks || dueTasks.length === 0) return;
-
-  for (const task of dueTasks) {
-    // claim it immediately so a second tick can't pick it up too
-    await supabase.from("scheduled_tasks").update({ status: "running" }).eq("id", task.id);
-    try {
-      const isReminder = task.kind === "reminder";
-      const result = isReminder ? task.message : await runResearch(task.topic);
-      if (task.recurrence && task.recurrence !== "once") {
-        const nextRun = computeNextRun(task.run_at, task.recurrence);
-        await supabase.from("scheduled_tasks").update({ status: "pending", run_at: nextRun, result }).eq("id", task.id);
-      } else {
-        await supabase.from("scheduled_tasks").update({ status: "done", result }).eq("id", task.id);
-      }
-      const icon = isReminder ? "⏰" : "🔎";
-      await bot.sendMessage(CHAT_ID, `${icon} ${result}`);
-    } catch (e) {
-      await supabase.from("scheduled_tasks").update({ status: "failed" }).eq("id", task.id);
-      await bot.sendMessage(CHAT_ID, `⚠️ Scheduled task "${task.topic || task.message}" failed: ${e.message}`);
-    }
-  }
-}
-
-async function runResearch(topic) {
-  const data = await fetchGeminiRotating(
-    (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${key}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: `Research this topic using web search and write a short, spoken-style briefing (4-6 sentences, no markdown, no headers, no bullet points) summarizing the most useful current findings: ${topic}`,
-              },
-            ],
-          },
-        ],
-        tools: [{ googleSearch: {} }],
-      }),
-    }
-  );
-  if (data.error) throw new Error(data.error.message || "Gemini research call failed");
-  const parts = data.candidates?.[0]?.content?.parts || [];
-  const text = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
-  return text || "Couldn't find anything useful.";
-}
-
-// ============================================================
-// PART 2 — general text chat with Gemini (NEW)
+// SYSTEM INSTRUCTION AND TOOLS
 // ============================================================
 const BASE_SYSTEM_INSTRUCTION = `You are Night Agent, a highly competent
-professional personal assistant the user talks to through Telegram (as well
-as a separate voice app). Address the user the way a sharp, professional
-personal assistant addresses their employer: respectful, efficient, and
-direct — never like a casual friend. Do NOT use slang, buddy-style address,
-or casual filler words (no "bro", "dude", "මචන්", "බන්", "යාළුවා", "ගගා", or
-similar) under any circumstances. If writing in Sinhala, use the
-respectful/formal register (e.g. address the user as "ඔබතුමා" or "සර්", not
-the casual "ඔයා") — natural, polished Sinhala, not textbook-stiff. Reply
-briefly — 2-4 short sentences, no markdown, no lists, no headers. If the
-user writes in Sinhala, reply in respectful Sinhala; otherwise reply in the
-same language they used, keeping the same formal register.
+professional personal assistant. Address the user respectfully and directly,
+never casually. Reply briefly — 2-4 short sentences, no markdown.
 
-You have twenty tools available:
-- save_memory: call this whenever the user tells you something worth
-  remembering (a preference, a recurring task, a fact about their life).
-  Keep saved facts short, third person (e.g. "User sleeps around 12:30am").
-- get_current_datetime: call this whenever you need today's date or time,
-  including before computing a future run_at time for schedule_research.
-- create_task_list: call this when the user gives you a goal or list of
-  things they want tracked. Break it into short ordered steps. After
-  calling it, tell the user you'll check in step-by-step right here on
-  Telegram — don't say you'll do the steps yourself right now.
-- schedule_research: call this when the user asks you to look something up
-  or research something at a specific future time, once or repeating (e.g.
-  "at 9am tomorrow" = once, "every morning at 6" = daily). Compute the
-  exact first run_at time. Tell the user you'll send findings here on
-  Telegram at that time — don't do the research yourself right now.
-- recall_memories: call this whenever the user asks what you know about
-  them in general, or what's saved — never guess, always call this tool.
-- search_memories: call this instead of recall_memories when the user asks
-  about a specific topic (e.g. "what do you know about my exams") — it
-  finds the most relevant saved facts for that topic, not just the newest.
-- list_active_goals: call this whenever the user asks about their current
-  tasks, goals, or what's pending — never guess, always call this tool.
-- update_goal_status: call this to mark a goal as "done" or "cancelled"
-  when the user says it's finished or no longer relevant, or when you
-  (during autonomous review) decide a stale goal should be closed.
-- get_calendar_events: call this whenever the user asks what's on their
-  calendar, schedule, or upcoming events — never guess, always call this
-  tool. If it reports Calendar isn't connected yet, tell the user that.
-- get_gmail_summary: call this whenever the user asks about their email,
-  inbox, or unread messages — never guess, always call this tool.
-- send_gmail: call this ONLY when the user has explicitly asked you to
-  send a specific email in THIS conversation and you're confident of the
-  recipient, subject, and content — read it back to confirm if there's any
-  ambiguity before sending. NEVER call this during autonomous background
-  review (only in direct response to the user asking, in the moment).
-- web_search: call this whenever the user asks something that needs
-  current, real-time information you wouldn't reliably know (news, prices,
-  scores, "what's going on with X", fact-checking something recent). Also
-  usable during autonomous review when something worth checking comes up.
-- schedule_reminder: call this when the user wants a plain message
-  delivered to them at a specific future time, once or repeating (e.g.
-  "remind me to call the plumber at 5pm", "ping me every morning at 7").
-  Unlike schedule_research, this does no research — it just delivers the
-  exact message you give it, at that time. Compute run_at using
-  get_current_datetime first, same as schedule_research.
-- create_calendar_event: call this when the user asks you to add something
-  to their calendar. If it reports the calendar isn't writable, tell the
-  user clearly (their Google connection may only be authorized for
-  read access) rather than pretending it worked.
-- get_drive_files: call this when the user asks about files in their Google
-  Drive, recent documents, or anything stored in Drive.
-- get_sheet_data: call this when the user asks for data from a specific
-  Google Sheet. They need to provide the spreadsheet ID and range.
-- get_doc_content: call this when the user wants to read the content of a
-  specific Google Doc by its ID.
-- get_contacts: call this when the user asks for contact information from
-  their Google Contacts (names, emails, phone numbers).
-- get_youtube_channel_analytics: call this when the user asks about their
-  YouTube channel performance, views, subscribers, or recent video stats.
+You have these tools:
+- save_memory: Save facts about the user
+- get_current_datetime: Get current date/time
+- create_task_list: Create a goal with steps
+- schedule_research: Schedule web research at a future time
+- recall_memories: Get recent saved facts
+- search_memories: Search for specific facts
+- list_active_goals: Show current goals
+- update_goal_status: Mark goal as done/cancelled
+- get_calendar_events: Check Google Calendar
+- get_gmail_summary: Check Gmail
+- send_gmail: Send email (ONLY when user explicitly asks)
+- web_search: Search the web for current info
+- schedule_reminder: Schedule a reminder message
+- create_calendar_event: Add event to calendar
+- get_drive_files: List files from Google Drive
+- get_sheet_data: Read Google Sheet data
+- get_doc_content: Read Google Doc content
+- get_contacts: Search Google Contacts
+- get_youtube_channel_analytics: Check YouTube stats
 
-If a tool result comes back with an error field, don't just give up or go
-silent — read the error, and either retry with corrected arguments (e.g.
-a differently formatted date) or clearly tell the user what went wrong and
-what you'd need to try again.`;
+If a tool errors, clearly tell the user what went wrong.`;
 
 const CHAT_TOOLS = [
   {
@@ -706,7 +476,7 @@ const CHAT_TOOLS = [
       },
       {
         name: "create_task_list",
-        description: "Save a goal broken into ordered steps, confirmed one at a time on Telegram.",
+        description: "Save a goal broken into ordered steps.",
         parameters: {
           type: "OBJECT",
           properties: {
@@ -718,21 +488,13 @@ const CHAT_TOOLS = [
       },
       {
         name: "schedule_research",
-        description:
-          "Schedule a research task for a specific future time, once or repeating. At that time, the agent will search the web on the given topic and send the findings on Telegram automatically — no confirmation needed.",
+        description: "Schedule a research task for a specific future time.",
         parameters: {
           type: "OBJECT",
           properties: {
             topic: { type: "STRING", description: "What to research." },
-            run_at: {
-              type: "STRING",
-              description:
-                "The exact first time to run this, as an ISO 8601 datetime WITH the timezone offset always included (e.g. 2026-08-12T06:00:00+05:30 for 6am Sri Lanka time). Never omit the offset. Compute this from the user's request and the current date/time (use get_current_datetime first — it returns time in Asia/Colombo).",
-            },
-            recurrence: {
-              type: "STRING",
-              description: "One of: once, daily, weekly. Defaults to once if not specified.",
-            },
+            run_at: { type: "STRING", description: "ISO 8601 datetime with timezone offset." },
+            recurrence: { type: "STRING", description: "One of: once, daily, weekly. Defaults to once." },
           },
           required: ["topic", "run_at"],
         },
@@ -744,16 +506,16 @@ const CHAT_TOOLS = [
       },
       {
         name: "search_memories",
-        description: "Find the saved facts most relevant to a specific topic or question.",
+        description: "Find saved facts most relevant to a specific topic.",
         parameters: {
           type: "OBJECT",
-          properties: { query: { type: "STRING", description: "The topic to search saved memories for." } },
+          properties: { query: { type: "STRING", description: "The topic to search for." } },
           required: ["query"],
         },
       },
       {
         name: "list_active_goals",
-        description: "Fetch the user's currently active goals/task lists and each step's status.",
+        description: "Fetch the user's currently active goals.",
         parameters: { type: "OBJECT", properties: {} },
       },
       {
@@ -784,14 +546,14 @@ const CHAT_TOOLS = [
         parameters: {
           type: "OBJECT",
           properties: {
-            query: { type: "STRING", description: "Gmail search query, e.g. 'is:unread' or 'is:important'. Defaults to is:unread." },
+            query: { type: "STRING", description: "Gmail search query. Defaults to 'is:unread'." },
             max_results: { type: "NUMBER", description: "Max emails to fetch. Defaults to 10." },
           },
         },
       },
       {
         name: "send_gmail",
-        description: "Send an email on the user's behalf. Only use when the user has clearly asked for this specific email to be sent.",
+        description: "Send an email on the user's behalf. Only use when the user has clearly asked.",
         parameters: {
           type: "OBJECT",
           properties: {
@@ -804,7 +566,7 @@ const CHAT_TOOLS = [
       },
       {
         name: "web_search",
-        description: "Search the web for current, real-time information not reliably known otherwise (news, prices, scores, recent events, fact-checks).",
+        description: "Search the web for current, real-time information.",
         parameters: {
           type: "OBJECT",
           properties: { query: { type: "STRING", description: "What to search for." } },
@@ -813,16 +575,12 @@ const CHAT_TOOLS = [
       },
       {
         name: "schedule_reminder",
-        description: "Schedule a plain message to be delivered automatically at a specific future time, once or repeating. Does no research — just delivers the exact message given.",
+        description: "Schedule a plain message to be delivered at a specific future time.",
         parameters: {
           type: "OBJECT",
           properties: {
-            message: { type: "STRING", description: "The exact message to send at that time." },
-            run_at: {
-              type: "STRING",
-              description:
-                "The exact first time to send this, as an ISO 8601 datetime WITH the timezone offset always included (e.g. 2026-08-12T17:00:00+05:30 for 5pm Sri Lanka time). Compute using get_current_datetime first.",
-            },
+            message: { type: "STRING", description: "The exact message to send." },
+            run_at: { type: "STRING", description: "ISO 8601 datetime with timezone offset." },
             recurrence: { type: "STRING", description: "One of: once, daily, weekly. Defaults to once." },
           },
           required: ["message", "run_at"],
@@ -835,9 +593,9 @@ const CHAT_TOOLS = [
           type: "OBJECT",
           properties: {
             title: { type: "STRING", description: "Event title." },
-            start: { type: "STRING", description: "Start time, ISO 8601 with timezone offset (e.g. 2026-08-12T17:00:00+05:30)." },
-            end: { type: "STRING", description: "End time, ISO 8601 with timezone offset. If omitted, defaults to 1 hour after start." },
-            description: { type: "STRING", description: "Optional event description/notes." },
+            start: { type: "STRING", description: "Start time, ISO 8601 with timezone offset." },
+            end: { type: "STRING", description: "End time, ISO 8601 with timezone offset. Defaults to 1 hour after start." },
+            description: { type: "STRING", description: "Optional event description." },
           },
           required: ["title", "start"],
         },
@@ -849,7 +607,7 @@ const CHAT_TOOLS = [
           type: "OBJECT",
           properties: {
             max_results: { type: "NUMBER", description: "Max files to return. Defaults to 10." },
-            query: { type: "STRING", description: "Optional search query (e.g., 'name contains \"project\"')." },
+            query: { type: "STRING", description: "Optional search query." },
           },
         },
       },
@@ -882,14 +640,14 @@ const CHAT_TOOLS = [
         parameters: {
           type: "OBJECT",
           properties: {
-            query: { type: "STRING", description: "Optional search query (name or email)." },
+            query: { type: "STRING", description: "Optional search query." },
             max_results: { type: "NUMBER", description: "Max contacts to return. Defaults to 10." },
           },
         },
       },
       {
         name: "get_youtube_channel_analytics",
-        description: "Get YouTube channel analytics including views, subscribers, and recent video performance.",
+        description: "Get YouTube channel analytics including views and subscribers.",
         parameters: {
           type: "OBJECT",
           properties: {
@@ -901,6 +659,9 @@ const CHAT_TOOLS = [
   },
 ];
 
+// ============================================================
+// DATABASE FUNCTIONS
+// ============================================================
 async function fetchRecentMemories(limit = 20) {
   const { data } = await supabase
     .from("agent_memories")
@@ -910,101 +671,32 @@ async function fetchRecentMemories(limit = 20) {
   return (data || []).reverse().map((r) => r.content);
 }
 
-function buildSystemInstruction(memories, profile) {
-  let instr = BASE_SYSTEM_INSTRUCTION;
-  if (profile) {
-    instr += `\n\nWhat you've learned about the user over time (an evolving picture — use this to engage naturally, don't just recite it):\n${profile}`;
-  }
-  if (memories.length > 0) {
-    instr += `\n\nSpecific saved facts:\n- ` + memories.join("\n- ");
-  }
-  return instr;
-}
-
 async function getUserProfile() {
   const { data } = await supabase.from("user_profile").select("summary").eq("id", 1).maybeSingle();
   return data?.summary || "";
 }
 
-// ============================================================
-// PART 4b — evolving user profile
-// Every 30 min: read recent conversation + the current profile, and ask
-// Gemini to produce a REVISED profile (not just appended) — a compact,
-// evolving picture of who the user is, updated as things change.
-// ============================================================
-setInterval(updateUserProfileFromRecent, 30 * 60 * 1000);
-
-async function updateUserProfileFromRecent() {
-  if (API_KEYS.length === 0) return;
-  try {
-    const currentProfile = await getUserProfile();
-    const { data: recentMsgs } = await supabase
-      .from("bot_messages")
-      .select("role, content, created_at")
-      .order("created_at", { ascending: false })
-      .limit(40);
-
-    if (!recentMsgs || recentMsgs.length < 6) return; // not enough new material yet
-
-    const transcript = recentMsgs.reverse().map((m) => `${m.role}: ${m.content}`).join("\n");
-    const prompt = `You maintain an evolving profile of the user, built from
-everything they've said over time, so you can engage with them more
-naturally and personally in future conversations.
-
-Current profile (may be empty if this is the first update):
-${currentProfile || "(none yet)"}
-
-Recent conversation to incorporate:
-${transcript}
-
-Write an UPDATED profile — a few short paragraphs covering: their interests
-and personality, how they like to communicate, what they're currently
-focused on or working towards, and anything notable about their situation.
-Don't just append to the old profile — revise and consolidate it, dropping
-anything now outdated or contradicted. Keep it under 200 words, plain prose,
-third person, no markdown.`;
-
-    const data = await fetchGeminiRotating(
-      (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${key}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
-      }
-    );
-    const newProfile = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (newProfile) {
-      await supabase.from("user_profile").upsert({ id: 1, summary: newProfile, updated_at: new Date().toISOString() });
-      console.log("📇 Updated user profile.");
-    }
-  } catch (e) {
-    console.error("updateUserProfileFromRecent error:", e.message);
-  }
-}
-
 async function saveMemory(content) {
-  const embedding = await getEmbedding(content).catch(() => null);
-  const { error } = await supabase.from("agent_memories").insert({ content, embedding });
-  return { saved: !error };
+  const { error } = await supabase.from("agent_memories").insert({ content });
+  return { saved: !error, error: error?.message };
 }
 
-async function getEmbedding(text) {
-  const data = await fetchGeminiRotating(
-    (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent?key=${key}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: { parts: [{ text }] } }),
-    }
-  );
-  if (!data.embedding?.values) throw new Error(data.error?.message || "no embedding returned");
-  return data.embedding.values;
+async function recallMemories() {
+  const { data, error } = await supabase
+    .from("agent_memories")
+    .select("content, created_at")
+    .order("created_at", { ascending: false })
+    .limit(50);
+  if (error) return { memories: [], reason: error.message };
+  return { memories: (data || []).map((r) => r.content) };
 }
 
 async function searchMemoriesSemantic(query) {
-  const embedding = await getEmbedding(query).catch(() => null);
-  if (!embedding) return { memories: [], reason: "embedding failed" };
-  const { data, error } = await supabase.rpc("match_memories", { query_embedding: embedding, match_count: 10 });
+  const { data, error } = await supabase
+    .from("agent_memories")
+    .select("content")
+    .ilike("content", `%${query}%`)
+    .limit(10);
   if (error) return { memories: [], reason: error.message };
   return { memories: (data || []).map((r) => r.content) };
 }
@@ -1021,14 +713,36 @@ async function scheduleResearch(topic, runAt, recurrence) {
   const { error } = await supabase
     .from("scheduled_tasks")
     .insert({ topic, run_at: runAt, status: "pending", recurrence: recurrence || "once", kind: "research" });
-  return { scheduled: !error, reason: error ? error.message : null, run_at: runAt, recurrence: recurrence || "once" };
+  return { scheduled: !error, reason: error ? error.message : null };
 }
 
 async function scheduleReminder(message, runAt, recurrence) {
   const { error } = await supabase
     .from("scheduled_tasks")
     .insert({ message, run_at: runAt, status: "pending", recurrence: recurrence || "once", kind: "reminder" });
-  return { scheduled: !error, reason: error ? error.message : null, run_at: runAt, recurrence: recurrence || "once" };
+  return { scheduled: !error, reason: error ? error.message : null };
+}
+
+async function updateGoalStatus(goalId, status) {
+  const { error } = await supabase.from("goals").update({ status }).eq("id", goalId);
+  return { updated: !error, reason: error ? error.message : null };
+}
+
+async function listActiveGoals() {
+  const { data: goals, error } = await supabase
+    .from("goals")
+    .select("id, title, status, goal_steps(step_number, description, status)")
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(10);
+  if (error) return { goals: [], reason: error.message };
+  const shaped = (goals || []).map((g) => ({
+    title: g.title,
+    steps: (g.goal_steps || [])
+      .sort((a, b) => a.step_number - b.step_number)
+      .map((s) => ({ description: s.description, status: s.status })),
+  }));
+  return { goals: shaped };
 }
 
 async function webSearch(query) {
@@ -1054,7 +768,7 @@ async function webSearch(query) {
 }
 
 async function createCalendarEvent(title, start, end, description) {
-  if (!GOOGLE_CONFIGURED) return { created: false, reason: "Google Calendar not connected yet" };
+  if (!GOOGLE_CONFIGURED) return { created: false, reason: "Google Calendar not connected" };
   try {
     const accessToken = await getGoogleAccessToken();
     const endTime = end || new Date(new Date(start).getTime() + 60 * 60 * 1000).toISOString();
@@ -1077,70 +791,36 @@ async function createCalendarEvent(title, start, end, description) {
   }
 }
 
-function computeNextRun(currentRunAt, recurrence) {
-  const d = new Date(currentRunAt);
-  if (recurrence === "daily") d.setDate(d.getDate() + 1);
-  else if (recurrence === "weekly") d.setDate(d.getDate() + 7);
-  return d.toISOString();
-}
-
-async function updateGoalStatus(goalId, status) {
-  const { error } = await supabase.from("goals").update({ status }).eq("id", goalId);
-  return { updated: !error, reason: error ? error.message : null };
-}
-
-async function recallMemories() {
-  const { data, error } = await supabase
-    .from("agent_memories")
-    .select("content, created_at")
-    .order("created_at", { ascending: false })
-    .limit(50);
-  if (error) return { memories: [], reason: error.message };
-  return { memories: (data || []).map((r) => r.content) };
-}
-
-async function listActiveGoals() {
-  const { data: goals, error } = await supabase
-    .from("goals")
-    .select("id, title, status, goal_steps(step_number, description, status)")
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(10);
-  if (error) return { goals: [], reason: error.message };
-  const shaped = (goals || []).map((g) => ({
-    title: g.title,
-    steps: (g.goal_steps || [])
-      .sort((a, b) => a.step_number - b.step_number)
-      .map((s) => ({ description: s.description, status: s.status })),
-  }));
-  return { goals: shaped };
-}
-
 async function executeFunctionCall(fc) {
-  if (fc.name === "save_memory") return await saveMemory(fc.args?.content || "");
-  if (fc.name === "create_task_list") return await createTaskList(fc.args?.title || "Untitled goal", fc.args?.steps || []);
-  if (fc.name === "schedule_research") return await scheduleResearch(fc.args?.topic || "", fc.args?.run_at || "", fc.args?.recurrence);
-  if (fc.name === "recall_memories") return await recallMemories();
-  if (fc.name === "search_memories") return await searchMemoriesSemantic(fc.args?.query || "");
-  if (fc.name === "list_active_goals") return await listActiveGoals();
-  if (fc.name === "update_goal_status") return await updateGoalStatus(fc.args?.goal_id, fc.args?.status);
-  if (fc.name === "get_calendar_events") return await getCalendarEvents(fc.args?.days_ahead || 7);
-  if (fc.name === "get_gmail_summary") return await getGmailSummary(fc.args?.max_results || 10, fc.args?.query || "is:unread");
-  if (fc.name === "send_gmail") return await sendGmail(fc.args?.to, fc.args?.subject, fc.args?.body);
-  if (fc.name === "web_search") return await webSearch(fc.args?.query || "");
-  if (fc.name === "schedule_reminder") return await scheduleReminder(fc.args?.message || "", fc.args?.run_at || "", fc.args?.recurrence);
-  if (fc.name === "create_calendar_event") return await createCalendarEvent(fc.args?.title || "Untitled event", fc.args?.start, fc.args?.end, fc.args?.description);
-  if (fc.name === "get_drive_files") return await getDriveFiles(fc.args?.max_results || 10, fc.args?.query || "");
-  if (fc.name === "get_sheet_data") return await getSheetData(fc.args?.spreadsheet_id, fc.args?.range);
-  if (fc.name === "get_doc_content") return await getDocContent(fc.args?.document_id);
-  if (fc.name === "get_contacts") return await getContacts(fc.args?.query || "", fc.args?.max_results || 10);
-  if (fc.name === "get_youtube_channel_analytics") return await getYouTubeAnalytics(fc.args?.channel_id || null);
-  if (fc.name === "get_current_datetime") {
-    return nowInTimezone();
+  try {
+    if (fc.name === "save_memory") return await saveMemory(fc.args?.content || "");
+    if (fc.name === "create_task_list") return await createTaskList(fc.args?.title || "Untitled goal", fc.args?.steps || []);
+    if (fc.name === "schedule_research") return await scheduleResearch(fc.args?.topic || "", fc.args?.run_at || "", fc.args?.recurrence);
+    if (fc.name === "recall_memories") return await recallMemories();
+    if (fc.name === "search_memories") return await searchMemoriesSemantic(fc.args?.query || "");
+    if (fc.name === "list_active_goals") return await listActiveGoals();
+    if (fc.name === "update_goal_status") return await updateGoalStatus(fc.args?.goal_id, fc.args?.status);
+    if (fc.name === "get_calendar_events") return await getCalendarEvents(fc.args?.days_ahead || 7);
+    if (fc.name === "get_gmail_summary") return await getGmailSummary(fc.args?.max_results || 10, fc.args?.query || "is:unread");
+    if (fc.name === "send_gmail") return await sendGmail(fc.args?.to, fc.args?.subject, fc.args?.body);
+    if (fc.name === "web_search") return await webSearch(fc.args?.query || "");
+    if (fc.name === "schedule_reminder") return await scheduleReminder(fc.args?.message || "", fc.args?.run_at || "", fc.args?.recurrence);
+    if (fc.name === "create_calendar_event") return await createCalendarEvent(fc.args?.title || "Untitled event", fc.args?.start, fc.args?.end, fc.args?.description);
+    if (fc.name === "get_drive_files") return await getDriveFiles(fc.args?.max_results || 10, fc.args?.query || "");
+    if (fc.name === "get_sheet_data") return await getSheetData(fc.args?.spreadsheet_id, fc.args?.range);
+    if (fc.name === "get_doc_content") return await getDocContent(fc.args?.document_id);
+    if (fc.name === "get_contacts") return await getContacts(fc.args?.query || "", fc.args?.max_results || 10);
+    if (fc.name === "get_youtube_channel_analytics") return await getYouTubeAnalytics(fc.args?.channel_id || null);
+    if (fc.name === "get_current_datetime") return nowInTimezone();
+    return { error: "unknown tool" };
+  } catch (e) {
+    return { error: true, message: e.message };
   }
-  return { error: "unknown tool" };
 }
 
+// ============================================================
+// CHAT HANDLER
+// ============================================================
 async function callGemini(contents, systemInstruction) {
   const data = await fetchGeminiRotating(
     (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${key}`,
@@ -1158,80 +838,64 @@ async function callGemini(contents, systemInstruction) {
   return data;
 }
 
-async function fetchRecentConversation(limit = 16) {
-  const { data } = await supabase
-    .from("bot_messages")
-    .select("role, content")
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  return (data || []).reverse();
-}
-
 async function handleChatMessage(userText) {
   if (API_KEYS.length === 0) {
-    return "⚠️ Debug: GEMINI_API_KEY is not set in Railway variables.";
+    return "⚠️ No Gemini API keys configured.";
   }
-  const memories = await fetchRecentMemories();
-  const profile = await getUserProfile();
-  const systemInstruction = buildSystemInstruction(memories, profile);
-
-  // bring in the last several turns of actual conversation so follow-up
-  // questions ("what about the second one?") work like a real chat.
-  // (the current userText was already logged to bot_messages by the
-  // caller before this ran, so drop that trailing duplicate here)
-  const history = await fetchRecentConversation();
-  if (history.length > 0) {
-    const last = history[history.length - 1];
-    if (last.role === "user" && last.content === userText) history.pop();
-  }
-  let contents = history.map((m) => ({
-    role: m.role === "agent" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-  contents.push({ role: "user", parts: [{ text: userText }] });
-
-  for (let i = 0; i < 5; i++) {
-    let data;
-    try {
-      data = await callGemini(contents, systemInstruction);
-    } catch (e) {
-      console.error("handleChatMessage callGemini failed after retries:", e.message);
-      return "⚠️ I couldn't reach Gemini right now (network issue) — try again in a moment.";
+  
+  try {
+    const memories = await fetchRecentMemories();
+    const profile = await getUserProfile();
+    
+    let systemInstruction = BASE_SYSTEM_INSTRUCTION;
+    if (profile) {
+      systemInstruction += `\n\nUser profile: ${profile}`;
+    }
+    if (memories.length > 0) {
+      systemInstruction += `\n\nSaved facts:\n- ` + memories.join("\n- ");
     }
 
-    if (data.error) {
-      return `⚠️ Debug — Gemini error: ${data.error.message || JSON.stringify(data.error)}`;
-    }
+    let contents = [{ role: "user", parts: [{ text: userText }] }];
 
-    const parts = data.candidates?.[0]?.content?.parts || [];
-    const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
-    const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
-
-    if (functionCalls.length === 0) {
-      if (textReply) return textReply;
-      return `⚠️ Debug — no text or function call in response: ${JSON.stringify(data).slice(0, 500)}`;
-    }
-
-    contents.push({ role: "model", parts });
-    const responseParts = [];
-    for (const fc of functionCalls) {
-      let result;
+    for (let i = 0; i < 3; i++) {
+      let data;
       try {
-        result = await executeFunctionCall(fc);
+        data = await callGemini(contents, systemInstruction);
       } catch (e) {
-        // feed the failure back to the model instead of crashing —
-        // it can see what went wrong and try a different approach
-        result = { error: true, message: e.message };
+        console.error("callGemini failed:", e.message);
+        return "⚠️ I couldn't reach Gemini right now. Please try again in a moment.";
       }
-      responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
+
+      if (data.error) {
+        return `⚠️ Gemini error: ${data.error.message || JSON.stringify(data.error)}`;
+      }
+
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
+      const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
+
+      if (functionCalls.length === 0) {
+        return textReply || "I processed your request but have no response.";
+      }
+
+      contents.push({ role: "model", parts });
+      const responseParts = [];
+      for (const fc of functionCalls) {
+        const result = await executeFunctionCall(fc);
+        responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
+      }
+      contents.push({ role: "user", parts: responseParts });
     }
-    contents.push({ role: "user", parts: responseParts });
+    
+    return "I completed the actions you requested.";
+  } catch (e) {
+    console.error("handleChatMessage error:", e);
+    return "⚠️ Something went wrong processing your request.";
   }
-  return "Sorry, something went wrong on my end.";
 }
 
 // ============================================================
-// PART 3 — logging every message (needed for both loops below)
+// BACKGROUND TASKS (simplified)
 // ============================================================
 async function logBotMessage(role, content) {
   if (!content) return;
@@ -1240,225 +904,89 @@ async function logBotMessage(role, content) {
   } catch (e) {}
 }
 
-// ============================================================
-// PART 4 — passive memory extraction (UPDATED: every 5 min)
-// Every 5 min: read unprocessed messages, ask Gemini what's worth
-// remembering long-term, save it, mark those messages as processed.
-// Catches things the live chat model didn't think to save_memory on.
-// ============================================================
-setInterval(extractMemoriesFromRecent, 5 * 60 * 1000);
-
-async function extractMemoriesFromRecent() {
-  if (API_KEYS.length === 0) return;
-  const { data: unprocessed } = await supabase
-    .from("bot_messages")
-    .select("*")
-    .eq("extracted", false)
-    .order("created_at", { ascending: true })
-    .limit(40);
-
-  if (!unprocessed || unprocessed.length < 4) return; // not enough new context yet
-
-  const transcript = unprocessed.map((m) => `${m.role}: ${m.content}`).join("\n");
-  const prompt = `Read this conversation and list any facts worth remembering
-long-term about the user (preferences, recurring habits, life context,
-upcoming deadlines). Write each as a short third-person sentence. Reply with
-ONLY a JSON array of strings, nothing else. If nothing is worth saving,
-reply with exactly: []
-
-Conversation:
-${transcript}`;
-
+setInterval(async () => {
   try {
-    const data = await fetchGeminiRotating(
-      (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${key}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
-      }
+    const { data: waiting } = await supabase
+      .from("goal_steps")
+      .select("id")
+      .eq("status", "awaiting_approval")
+      .limit(1)
+      .maybeSingle();
+    if (waiting) return;
+
+    const { data: nextStep } = await supabase
+      .from("goal_steps")
+      .select("*, goals!inner(status, title)")
+      .eq("status", "pending")
+      .eq("goals.status", "active")
+      .order("goal_id", { ascending: true })
+      .order("step_number", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (!nextStep) return;
+
+    await supabase.from("goal_steps").update({ status: "awaiting_approval" }).eq("id", nextStep.id);
+    await bot.sendMessage(
+      CHAT_ID,
+      `🌙 "${nextStep.goals.title}" — step ${nextStep.step_number}:\n${nextStep.description}\n\nReply "ok" when done, or "skip" to skip this step.`
     );
-    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "[]";
-    const cleaned = raw.replace(/```json|```/g, "").trim();
-    let facts = [];
-    try { facts = JSON.parse(cleaned); } catch (e) { facts = []; }
-
-    for (const fact of facts) {
-      await saveMemory(fact);
-    }
-    if (facts.length > 0) {
-      console.log(`Extracted ${facts.length} memories from background scan.`);
-    }
   } catch (e) {
-    console.error("extractMemoriesFromRecent error:", e.message);
+    console.error("checkAndSendNextStep error:", e.message);
   }
-
-  const ids = unprocessed.map((m) => m.id);
-  await supabase.from("bot_messages").update({ extracted: true }).in("id", ids);
-}
+}, 30000);
 
 // ============================================================
-// PART 5 — autonomous thinking loop (UPDATED: every 5 min)
-// Every 5 min: look at memories + active goals + recent chat + the
-// current time, and decide whether to proactively do or say something.
-// Most ticks should do nothing — this is deliberately conservative.
+// MAIN MESSAGE HANDLER
 // ============================================================
-const AUTONOMOUS_SYSTEM_INSTRUCTION = `You are Night Agent's autonomous
-background process, running silently every ~5 minutes even when the user
-isn't actively chatting. Decide if there's anything worth proactively doing
-right now, based on the context you're given. You may take several actions
-in a row this tick if needed (e.g. update_goal_status on a stale goal, then
-save_memory noting why) — call tools as many times as genuinely useful, then
-stop.
+const YES_WORDS = ["ok", "okay", "yes", "done", "start", "ඔව්", "හරි", "කලා"];
+const SKIP_WORDS = ["skip", "no", "later", "එපා", "පස්සේ"];
 
-CRITICAL: Before taking ANY action, check if you've already sent a similar
-message in the last 2 hours. Check the recent conversation below. If you
-already nudged about the same thing recently, do NOT repeat it.
-
-Good reasons to act:
-- A goal step has been sitting pending or awaiting_approval for a long time
-  (many hours) — a gentle nudge is fine.
-- A goal looks abandoned/stale (no progress in days) — consider marking it
-  cancelled with update_goal_status instead of nagging forever.
-- A known fact implies something time-sensitive is coming up soon and no
-  task exists for it yet — consider schedule_reminder for a simple nudge, or
-  create_task_list if it needs multiple steps.
-- A calendar event is coming up soon (next few hours) and it seems worth a
-  heads-up, especially if it needs prep the user hasn't mentioned doing.
-- The user asked you to check on or remind them about something and enough
-  time has clearly passed.
-- The user recently mentioned a genuine, specific interest or open question
-  worth following up on (a topic, a decision they're weighing, something
-  they said they'd look into). Use web_search or schedule_research (with
-  run_at set to right now via get_current_datetime) to look into it and
-  report back. Phrase the finding as a concise, useful briefing — direct and
-  professional, not chatty. Don't do this for every passing mention — only
-  genuine open threads, and never research the same thing twice (check
-  recent conversation and memories first).
-
-NEVER call send_gmail during this autonomous review — sending email is only
-ever done in direct response to the user explicitly asking, in the moment.
-
-Be conservative — most ticks, there is nothing worth doing. When you are
-completely done acting for this tick (including if you decided to do
-nothing), your FINAL reply must be exactly: NOTHING — unless you want to
-send the user a message right now, in which case your final reply is that
-short, professional message instead (2-3 sentences, no markdown).`;
-
-setInterval(autonomousTick, 5 * 60 * 1000);
-
-async function autonomousTick() {
-  if (API_KEYS.length === 0) return;
-  try {
-    const memories = await fetchRecentMemories();
-    const profile = await getUserProfile();
-    const { goals } = await listActiveGoals();
-    const { events: calendarEvents } = GOOGLE_CONFIGURED ? await getCalendarEvents(3) : { events: [] };
-    const { data: recentMsgs } = await supabase
-      .from("bot_messages")
-      .select("role, content, created_at")
-      .order("created_at", { ascending: false })
-      .limit(15);
-
-    const contextText = `Current time: ${nowInTimezone().readable} (${TIMEZONE})
-
-User profile: ${profile || "none yet"}
-
-Known facts:
-${memories.length ? memories.map((m) => `- ${m}`).join("\n") : "none"}
-
-Active goals (each has an id you can pass to update_goal_status):
-${goals.length ? JSON.stringify(goals) : "none"}
-
-Calendar events in the next 3 days:
-${calendarEvents.length ? JSON.stringify(calendarEvents) : "none / not connected"}
-
-Recent conversation (most recent last):
-${(recentMsgs || []).reverse().map((m) => `${m.role}: ${m.content}`).join("\n") || "none"}
-
-Decide if you should act now.`;
-
-    let contents = [{ role: "user", parts: [{ text: contextText }] }];
-
-    // chained loop — the agent can take several actions in one tick
-    for (let i = 0; i < 4; i++) {
-      let data;
-      try {
-        data = await callGemini(contents, AUTONOMOUS_SYSTEM_INSTRUCTION);
-      } catch (e) {
-        console.error("autonomousTick callGemini failed after retries:", e.message);
-        return; // stay silent this tick, try again next tick
-      }
-      if (data.error) { console.error("autonomousTick Gemini error:", data.error.message); return; }
-
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
-      const text = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
-
-      if (functionCalls.length === 0) {
-        if (text && text.toUpperCase() !== "NOTHING") {
-          await bot.sendMessage(CHAT_ID, `🌙 ${text}`);
-          await logBotMessage("agent", text);
-        }
-        return;
-      }
-
-      contents.push({ role: "model", parts });
-      const responseParts = [];
-      for (const fc of functionCalls) {
-        let result;
-        try {
-          result = await executeFunctionCall(fc);
-        } catch (e) {
-          result = { error: true, message: e.message };
-        }
-        console.log("Autonomous tool call:", fc.name, JSON.stringify(result));
-        responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
-      }
-      contents.push({ role: "user", parts: responseParts });
-    }
-  } catch (e) {
-    console.error("autonomousTick error:", e.message);
-  }
-}
-
-// ============================================================
-// message router — decides: is this a step reply, or general chat?
-// ============================================================
 bot.on("message", async (msg) => {
   if (String(msg.chat.id) !== String(CHAT_ID)) return;
-  if (!msg.text) return; // voice/files not handled yet
+  if (!msg.text) return;
+  
   const text = msg.text.trim();
   const lower = text.toLowerCase();
-  logBotMessage("user", text);
+  await logBotMessage("user", text);
 
-  const { data: waiting } = await supabase
-    .from("goal_steps")
-    .select("*, goals!inner(title)")
-    .eq("status", "awaiting_approval")
-    .order("id", { ascending: true })
-    .limit(1)
-    .maybeSingle();
+  try {
+    const { data: waiting } = await supabase
+      .from("goal_steps")
+      .select("*, goals!inner(title)")
+      .eq("status", "awaiting_approval")
+      .order("id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
 
-  if (waiting && YES_WORDS.includes(lower)) {
-    await supabase.from("goal_steps").update({ status: "done" }).eq("id", waiting.id);
-    await maybeCompleteGoal(waiting.goal_id, waiting.goals.title);
-    await bot.sendMessage(CHAT_ID, `✅ Done: ${waiting.description}`);
-    logBotMessage("agent", `Done: ${waiting.description}`);
-    checkAndSendNextStep();
-    return;
+    if (waiting && YES_WORDS.includes(lower)) {
+      await supabase.from("goal_steps").update({ status: "done" }).eq("id", waiting.id);
+      await bot.sendMessage(CHAT_ID, `✅ Done: ${waiting.description}`);
+      await logBotMessage("agent", `Done: ${waiting.description}`);
+      return;
+    }
+    
+    if (waiting && SKIP_WORDS.includes(lower)) {
+      await supabase.from("goal_steps").update({ status: "skipped" }).eq("id", waiting.id);
+      await bot.sendMessage(CHAT_ID, `⏭️ Skipped: ${waiting.description}`);
+      await logBotMessage("agent", `Skipped: ${waiting.description}`);
+      return;
+    }
+
+    bot.sendChatAction(CHAT_ID, "typing");
+    const reply = await handleChatMessage(text);
+    await bot.sendMessage(CHAT_ID, reply);
+    await logBotMessage("agent", reply);
+  } catch (e) {
+    console.error("Message handler error:", e);
+    await bot.sendMessage(CHAT_ID, "⚠️ Sorry, something went wrong. Please try again.");
   }
-  if (waiting && SKIP_WORDS.includes(lower)) {
-    await supabase.from("goal_steps").update({ status: "skipped" }).eq("id", waiting.id);
-    await bot.sendMessage(CHAT_ID, `⏭️ Skipped: ${waiting.description}`);
-    logBotMessage("agent", `Skipped: ${waiting.description}`);
-    checkAndSendNextStep();
-    return;
-  }
-
-  // not a step reply — treat as general conversation
-  bot.sendChatAction(CHAT_ID, "typing");
-  const reply = await handleChatMessage(text);
-  await bot.sendMessage(CHAT_ID, reply);
-  logBotMessage("agent", reply);
 });
+
+// ============================================================
+// STARTUP
+// ============================================================
+console.log(`🚀 Night Agent started with ${API_KEYS.length} Gemini keys`);
+console.log(`✅ Google OAuth: ${GOOGLE_CONFIGURED ? 'Configured' : 'Not configured'}`);
+console.log(`✅ Model: ${GEMINI_TEXT_MODEL}`);
+console.log(`✅ Timezone: ${TIMEZONE}`); Tasks Bot — standalone project
