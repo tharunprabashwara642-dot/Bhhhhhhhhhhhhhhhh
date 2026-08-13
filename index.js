@@ -409,7 +409,7 @@ async function fetchGeminiRotating(urlBuilder, options) {
 
 // Confirmed current model — gemini-1.5-flash and gemini-2.5-flash are both
 // retired; don't let a future edit "fix" this back to an older name.
-const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-3.5-flash";
+const GEMINI_TEXT_MODEL = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
 const GEMINI_EMBEDDING_MODEL = "text-embedding-004";
 const TIMEZONE = "Asia/Colombo";
 
