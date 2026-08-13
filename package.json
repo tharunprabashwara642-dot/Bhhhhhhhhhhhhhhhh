@@ -1,27 +1,13 @@
 {
-  "name": "night-agent-tasks-bot",
+  "name": "night-agent",
   "version": "1.0.0",
-  "description": "Night Agent Telegram Bot",
+  "description": "Night Agent Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": "18.x"
   },
-  "dependencies": {
-    "node-telegram-bot-api": "^0.61.0",
-    "@supabase/supabase-js": "^2.39.0"
-  }
-}
-  "name": "night-agent-tasks-bot",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
-    "@supabase/supabase-js": "^2.45.0"
-  }
+  "dependencies": {}
 }
