@@ -216,16 +216,20 @@ const supabase = createClient(
 const TELEGRAM_SAFE_CHUNK = 4000; // headroom under Telegram's 4096 hard limit
 const TELEGRAM_ABSOLUTE_CAP = 12000; // beyond this, truncate instead of spamming many chunks
 
+function formatMessageWithEmojis(text) {
+  if (!text) return "";
+  const lines = String(text).split("\n").filter(Boolean);
+  return lines.map(line => `🔹 ${line}`).join("\n\n");
+}
+
 function splitIntoChunks(text, maxLen) {
   const chunks = [];
   let remaining = text;
   while (remaining.length > maxLen) {
-    // Prefer splitting on a paragraph/line/word break before the limit so
-    // we never cut a sentence or a Markdown entity (e.g. **bold**) in half.
     let cut = remaining.lastIndexOf("\n\n", maxLen);
     if (cut < maxLen * 0.5) cut = remaining.lastIndexOf("\n", maxLen);
     if (cut < maxLen * 0.5) cut = remaining.lastIndexOf(" ", maxLen);
-    if (cut < maxLen * 0.5) cut = maxLen; // no good break point nearby, hard-cut
+    if (cut < maxLen * 0.5) cut = maxLen;
     chunks.push(remaining.slice(0, cut).trim());
     remaining = remaining.slice(cut).trim();
   }
@@ -235,18 +239,15 @@ function splitIntoChunks(text, maxLen) {
 
 async function sendLongMessage(chatId, text, options = {}) {
   if (!text) return;
-  let content = String(text);
+  let content = formatMessageWithEmojis(text);
   if (content.length > TELEGRAM_ABSOLUTE_CAP) {
-    content = content.slice(0, TELEGRAM_ABSOLUTE_CAP) + "\n\n… (response truncated — ask me for more detail on any part)";
+    content = content.slice(0, TELEGRAM_ABSOLUTE_CAP) + "\n\n⚠️ (response truncated — ask me for more detail on any part)";
   }
   const chunks = splitIntoChunks(content, TELEGRAM_SAFE_CHUNK);
   for (let i = 0; i < chunks.length; i++) {
     try {
       await bot.sendMessage(chatId, chunks[i], options);
     } catch (e) {
-      // Markdown/entity parsing can occasionally break mid-split even with
-      // the paragraph-aware cut above — fall back to plain text for that
-      // chunk instead of losing it entirely.
       console.error(`⚠️ sendLongMessage chunk ${i + 1}/${chunks.length} failed (${e.message}), retrying as plain text`);
       try {
         await bot.sendMessage(chatId, chunks[i]);
