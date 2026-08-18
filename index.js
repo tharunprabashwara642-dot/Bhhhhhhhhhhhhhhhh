@@ -96,6 +96,45 @@
 //                        self-edits that auto-redeploy)
 //   OWN_CODE_PATH       (file path of this file in that repo — default index.js)
 //   AGENT_ENABLE_SHELL  ("true" enables the run_shell_command tool)
+//   AUTONOMOUS_INTERVAL_MINUTES (how often the background autonomous tick
+//                        runs and works through the self-task queue —
+//                        default 5 minutes)
+//   AGENT_PROACTIVE     ("true" enables the fully proactive autonomous mode
+//                        where the bot actively researches, follows up and
+//                        checks in on its own instead of only reacting to
+//                        goals/reminders — default true)
+
+// ============================================================
+// NEW in THIS update — PERSISTENT SELF-TASK QUEUE (true autonomy)
+// ============================================================
+// The bot keeps its OWN background to-do list in Supabase and works it
+// every autonomous tick, with no user command needed:
+//
+//   - create_self_task: the agent files work items for itself (research a
+//     topic the user mentioned, follow up on a thread, check a repo, draft
+//     something) with a priority, optional delay, and optional recurrence.
+//   - The autonomous tick picks up due tasks, executes them with the full
+//     tool set (web_search, read_webpage, GitHub, Railway, Google, memory,
+//     custom/MCP tools), retries failures with backoff, and reports the
+//     finished result in Telegram when it's worth the user's attention.
+//
+// Run once in the Supabase SQL editor (safe to re-run):
+//
+//   create table if not exists agent_self_tasks (
+//     id uuid primary key default gen_random_uuid(),
+//     title text not null,
+//     description text not null default '',
+//     status text not null default 'pending',  -- pending | in_progress | done | failed | cancelled
+//     priority int not null default 5,          -- 1 (low) .. 10 (high)
+//     not_before timestamptz not null default now(),
+//     recurrence text,                          -- null | daily | weekly
+//     attempts int not null default 0,
+//     max_attempts int not null default 3,
+//     last_error text,
+//     result_summary text,
+//     created_at timestamptz not null default now(),
+//     updated_at timestamptz not null default now()
+//   );
 
 // ============================================================
 // NEW in THIS update
@@ -2449,6 +2488,10 @@ You have these tools:
 - save_memory: Save facts about the user
 - get_current_datetime: Get current date/time
 - create_task_list: Create a goal with steps
+- create_self_task: File a background task for yourself (executed by the
+  autonomous tick — for self-initiated work, research, follow-ups)
+- list_self_tasks / update_self_task / delete_self_task: Manage your own
+  background task queue
 - schedule_research: Schedule web research at a future time
 - recall_memories: Get recent saved facts
 - search_memories: Search for specific facts (semantic — finds the most
@@ -2737,6 +2780,54 @@ const CHAT_TOOLS = [
         },
       },
       {
+        name: "create_self_task",
+        description: "File a background task for YOURSELF — something worth doing on your own clock without the user asking right now (research a topic, follow up on a thread, watch a repo, draft something). The autonomous tick executes it with the full tool set. Use this for proactive/self-initiated work instead of a multi-step goal (create_task_list is for user-facing step-by-step plans).",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            title: { type: "STRING", description: "Short clear title of the task." },
+            description: { type: "STRING", description: "What exactly to do — enough detail that you can execute it later with no user input." },
+            priority: { type: "NUMBER", description: "1-10, higher runs sooner. Default 5." },
+            not_before: { type: "STRING", description: "Optional ISO 8601 datetime — don't run before this time." },
+            recurrence: { type: "STRING", description: "Optional: daily or weekly to re-file the task after each run." },
+          },
+          required: ["title"],
+        },
+      },
+      {
+        name: "list_self_tasks",
+        description: "List your current background self-tasks (pending by default) so you know what's queued, in-flight, or failed.",
+        parameters: {
+          type: "OBJECT",
+          properties: { status: { type: "STRING", description: "One of: pending, in_progress, done, failed, cancelled. Defaults to pending." } },
+        },
+      },
+      {
+        name: "update_self_task",
+        description: "Change a self-task's status, priority, due time, or title. Use status 'cancelled' to drop a queued task.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            id: { type: "STRING", description: "The self-task id." },
+            status: { type: "STRING", description: "One of: pending, in_progress, done, failed, cancelled." },
+            priority: { type: "NUMBER", description: "1-10, higher runs sooner." },
+            not_before: { type: "STRING", description: "New ISO 8601 due time." },
+            description: { type: "STRING", description: "New description." },
+            title: { type: "STRING", description: "New title." },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "delete_self_task",
+        description: "Permanently remove a self-task by id.",
+        parameters: {
+          type: "OBJECT",
+          properties: { id: { type: "STRING", description: "The self-task id." } },
+          required: ["id"],
+        },
+      },
+      {
         name: "schedule_research",
         description: "Schedule a research task for a specific future time.",
         parameters: {
@@ -2816,7 +2907,7 @@ const CHAT_TOOLS = [
       },
       {
         name: "web_search",
-        description: "Search the web for current, real-time information.",
+        description: "Search the web for current, real-time information. Returns a concise answer when live grounding works, OR a list of real result titles/URLs/snippets (DuckDuckGo fallback) — if you get the fallback list, read the most relevant URL with read_webpage to get the full content before answering.",
         parameters: {
           type: "OBJECT",
           properties: { query: { type: "STRING", description: "What to search for." } },
@@ -4059,6 +4150,125 @@ async function deleteDeployedSite(projectIdOrName) {
 let lastSearchFailNotify = 0;
 const SEARCH_FAIL_NOTIFY_COOLDOWN_MS = 5 * 60 * 1000;
 
+// (NEW) Independent web search fallbacks — used when Gemini's grounded
+// (googleSearch) tool is out of quota or otherwise fails, so web_search
+// keeps working without a paid API key. Tries DuckDuckGo first, then Bing.
+// Both are no-key HTML scraping, no npm dependency — just fetch.
+function decodeHtmlEntities(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#x2F;/g, "/")
+    .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(parseInt(n, 10)); } catch (_) { return _; } })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => { try { return String.fromCodePoint(parseInt(n, 16)); } catch (_) { return _; } })
+    .replace(/&nbsp;/g, " ");
+}
+
+async function duckDuckGoSearch(query, maxResults = 5) {
+  if (!query || !query.trim()) return { results: [], reason: "No query given." };
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query.trim())}&ia=web`;
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+  }, 20000);
+  if (!res.ok) {
+    throw new Error(`DuckDuckGo returned HTTP ${res.status}`);
+  }
+  const html = await res.text();
+
+  // DDG serves a CAPTCHA/anomaly wall (HTTP 202) to bots. Detect it early
+  // and fall through to the next engine instead of returning empty results.
+  if (res.status === 202 || html.includes("anomaly") || /captcha|challenge|bot[_-]detect/i.test(html)) {
+    throw new Error("DuckDuckGo served a bot-detection wall");
+  }
+
+  // Parse DDG's HTML result blocks: each result is a <a class="result__a"
+  // href="...">Title</a> with an optional <a class="result__snippet"> below.
+  const results = [];
+  const linkRe = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+  const links = [];
+  let m;
+  while ((m = linkRe.exec(html)) && links.length < maxResults) {
+    let href = m[1].trim();
+    // DDG wraps result URLs in /l/?uddg=...&rut=... — decode back to the
+    // real destination so the model can actually follow the link.
+    const uddg = href.match(/[?&]uddg=([^&]+)/);
+    if (uddg) {
+      try { href = decodeURIComponent(uddg[1]); } catch (_) { /* keep raw */ }
+    }
+    if (!/^https?:\/\//i.test(href)) continue;
+    const title = decodeHtmlEntities(m[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
+    if (!title) continue;
+    links.push({ href, title });
+  }
+  const snippets = [];
+  while ((m = snippetRe.exec(html)) && snippets.length < maxResults) {
+    snippets.push(decodeHtmlEntities(m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim()));
+  }
+  links.forEach((l, i) => {
+    results.push({ title: l.title, url: l.href, snippet: snippets[i] || "" });
+  });
+  if (results.length === 0) {
+    return { results: [], reason: "DuckDuckGo returned no parseable results." };
+  }
+  return { results };
+}
+
+// Bing fallback — its result markup is stable and generally doesn't bot-wall
+// plain fetches. Results have real title/snippet in the <li class="b_algo">
+// blocks; the href is a /ck/a redirect we decode back to the actual URL.
+async function bingSearch(query, maxResults = 5) {
+  if (!query || !query.trim()) return { results: [], reason: "No query given." };
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query.trim())}&setlang=en&count=10`;
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+  }, 20000);
+  if (!res.ok) throw new Error(`Bing returned HTTP ${res.status}`);
+  const html = await res.text();
+  if (html.includes("b_algo") === false) {
+    throw new Error("Bing returned no result blocks (bot wall or empty SERP)");
+  }
+  const blocks = html.split(/<li class="b_algo"/).slice(1);
+  const results = [];
+  for (const block of blocks) {
+    if (results.length >= maxResults) break;
+    const linkMatch = block.match(/<h2[^>]*><a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a><\/h2>/);
+    if (!linkMatch) continue;
+    let href = linkMatch[1].replace(/&amp;/g, "&").trim();
+    // Bing's /ck/a redirect carries the real URL in the u=a1<base64url> param.
+    const b64 = href.match(/[?&]u=a1([A-Za-z0-9_=-]+)/);
+    if (b64) {
+      try {
+        const decoded = Buffer.from(b64[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+        if (/^https?:\/\//i.test(decoded)) href = decoded;
+      } catch (_) { /* keep redirect URL */ }
+    }
+    if (!/^https?:\/\//i.test(href) || href.includes("bing.com/ck/a")) continue;
+    const title = decodeHtmlEntities(linkMatch[2].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
+    if (!title) continue;
+    const snippetMatch = block.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+    const snippet = snippetMatch
+      ? decodeHtmlEntities(snippetMatch[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim()).slice(0, 500)
+      : "";
+    results.push({ title, url: href, snippet });
+  }
+  if (results.length === 0) {
+    return { results: [], reason: "Bing returned no parseable results." };
+  }
+  return { results };
+}
+
 async function webSearch(query) {
   try {
     const data = await fetchGeminiRotating(
@@ -4075,20 +4285,47 @@ async function webSearch(query) {
     if (data.error) throw new Error(data.error.message);
     const parts = data.candidates?.[0]?.content?.parts || [];
     const text = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
-    return { result: text || "No useful results found." };
+    if (text) return { result: text, source: "gemini_grounding" };
+    // (NEW) Gemini returned no text at all — fall through to DuckDuckGo
+    // instead of reporting "No useful results found."
+    console.error("⚠️ Gemini grounded search returned empty — falling back to DuckDuckGo.");
+    throw new Error("Gemini grounded search returned empty text");
   } catch (e) {
-    // (NEW) fetchGeminiRotating already tried every key in the pool before
-    // throwing here — if grounding is out of quota on all of them, that's
-    // very likely a project-level grounding quota (shared across keys on
-    // the same Google Cloud project), not a per-key RPM issue. Log it
-    // clearly and let the agent keep answering without live search instead
-    // of the whole turn failing.
-    console.error(`⚠️ webSearch failed after trying all ${API_KEYS.length} keys — likely shared grounding quota, not per-key rate limit: ${e.message}`);
+    // (NEW) If Gemini grounding is out of quota or otherwise failed, try
+    // independent no-key fallbacks (DuckDuckGo then Bing) so live search
+    // keeps working. Only if ALL of them fail do we degrade to
+    // knowledge-only.
+    let fallbackError = null;
+    const engines = [duckDuckGoSearch, bingSearch];
+    for (const engine of engines) {
+      try {
+        const res = await engine(query);
+        if (res.results && res.results.length > 0) {
+          const formatted = res.results
+            .map((r, i) => {
+              const line = `${i + 1}. ${r.title}\n   ${r.url}`;
+              return r.snippet ? `${line}\n   ${r.snippet}` : line;
+            })
+            .join("\n");
+          console.error(`⚠️ Gemini web search failed (${e.message}) — using ${engine.name} fallback with ${res.results.length} results.`);
+          return {
+            result: formatted,
+            source: engine.name,
+            note: "These are live search results (title / URL / snippet). Use read_webpage on the most relevant URL to get full page content if needed.",
+          };
+        }
+        fallbackError = new Error(res.reason || `${engine.name} returned no results`);
+      } catch (engineErr) {
+        fallbackError = engineErr;
+        console.error(`⚠️ ${engine.name} fallback failed: ${engineErr.message}`);
+      }
+    }
+    console.error(`⚠️ webSearch failed after trying all ${API_KEYS.length} keys AND DuckDuckGo AND Bing — likely shared grounding quota, not per-key rate limit. Gemini: ${e.message}. Fallbacks: ${fallbackError?.message}`);
     const now = Date.now();
     if (now - lastSearchFailNotify > SEARCH_FAIL_NOTIFY_COOLDOWN_MS) {
       lastSearchFailNotify = now;
       try {
-        await bot.sendMessage(CHAT_ID, `⚠️ Web search දැනට available නෑ (${e.message}) — search නැතුව continue කරනවා.`);
+        await bot.sendMessage(CHAT_ID, `⚠️ Web search දැනට available නෑ (Gemini: ${e.message}; fallback: ${fallbackError?.message || "unknown"}) — search නැතුව continue කරනවා.`);
       } catch (_) {}
     }
     return { result: null, reason: `Search unavailable right now (${e.message}). Answer from existing knowledge without live search results, and tell the user you couldn't verify this with a live search.` };
@@ -4371,6 +4608,10 @@ async function sendConfirmationButtons() {
 async function runToolDirectly(name, args) {
   args = args || {};
   if (name === "save_memory") return await saveMemory(args.content || "");
+  if (name === "create_self_task") return await createSelfTask(args);
+  if (name === "list_self_tasks") return await listSelfTasks(args);
+  if (name === "update_self_task") return await updateSelfTask(args.id, args);
+  if (name === "delete_self_task") return await deleteSelfTask(args.id);
   if (name === "create_task_list") {
     const result = await createTaskList(args.title || "Untitled goal", args.steps || []);
     if (result.created) {
@@ -4477,6 +4718,7 @@ async function executeFunctionCall(fc, goalContext) {
         goalId: goalContext?.goalId || null,
         stepId: goalContext?.stepId || null,
         goalTitle: goalContext?.title || null,
+        selfTaskId: goalContext?.selfTaskId || null,
       });
       return {
         status: "pending_confirmation",
@@ -4756,6 +4998,220 @@ async function maybeCompleteGoal(goalId, title) {
     await bot.sendMessage(CHAT_ID, `🎉 All steps done for "${title}"!`);
   }
 }
+
+// ============================================================
+// SELF-TASK QUEUE — the agent's OWN persistent background to-do list.
+// Unlike `goals` (multi-step plans with buttons and progress messages),
+// a self-task is a single work item the agent files for itself and the
+// autonomous tick executes with the full tool set. This is what makes the
+// bot genuinely autonomous: it can decide "I should research this" or
+// "I should follow up on that" and then actually do it on its own clock,
+// retrying failures and reporting back only when there's something useful.
+// ============================================================
+const TRACKED_SELF_TASKS = new Set(); // ids currently being driven by a loop
+
+async function createSelfTask({ title, description = "", priority = 5, not_before, recurrence }) {
+  if (!title || !title.trim()) return { created: false, reason: "Title is required." };
+  const prio = Math.max(1, Math.min(10, parseInt(priority, 10) || 5));
+  let notBefore = not_before ? new Date(not_before) : new Date();
+  if (isNaN(notBefore.getTime())) notBefore = new Date();
+  const rec = ["daily", "weekly"].includes(recurrence) ? recurrence : null;
+  const { data, error } = await supabase
+    .from("agent_self_tasks")
+    .insert({ title: title.trim(), description, priority: prio, not_before: notBefore.toISOString(), recurrence: rec })
+    .select()
+    .single();
+  if (error) return { created: false, reason: error.message };
+  console.log(`🤖 Self-task filed: "${data.title}" (priority ${prio}, due ${notBefore.toISOString()})`);
+  return { created: true, id: data.id, title: data.title, priority: prio, not_before: data.not_before, recurrence: rec };
+}
+
+async function listSelfTasks({ status = "pending" } = {}) {
+  const valid = ["pending", "in_progress", "done", "failed", "cancelled"];
+  const st = valid.includes(status) ? status : "pending";
+  const { data, error } = await supabase
+    .from("agent_self_tasks")
+    .select("*")
+    .eq("status", st)
+    .order("priority", { ascending: false })
+    .order("not_before", { ascending: true })
+    .limit(30);
+  if (error) return { tasks: [], reason: error.message };
+  return {
+    tasks: (data || []).map((t) => ({
+      id: t.id, title: t.title, status: t.status, priority: t.priority,
+      due: t.not_before, attempts: t.attempts, last_error: t.last_error || null,
+    })),
+  };
+}
+
+async function updateSelfTask(id, { status, priority, not_before, description, title }) {
+  if (!id) return { updated: false, reason: "Task id is required." };
+  const patch = {};
+  if (title) patch.title = String(title);
+  if (description !== undefined) patch.description = String(description);
+  if (status) patch.status = String(status);
+  if (priority) patch.priority = Math.max(1, Math.min(10, parseInt(priority, 10) || 5));
+  if (not_before) {
+    const d = new Date(not_before);
+    if (isNaN(d.getTime())) return { updated: false, reason: `Could not parse not_before "${not_before}".` };
+    patch.not_before = d.toISOString();
+  }
+  const { data, error } = await supabase
+    .from("agent_self_tasks")
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .select()
+    .maybeSingle();
+  if (error) return { updated: false, reason: error.message };
+  return { updated: true, id: data.id, title: data.title, status: data.status };
+}
+
+async function deleteSelfTask(id) {
+  if (!id) return { deleted: false, reason: "Task id is required." };
+  const { error } = await supabase.from("agent_self_tasks").delete().eq("id", id);
+  if (error) return { deleted: false, reason: error.message };
+  return { deleted: true };
+}
+
+// Executes ONE self-task: drives its own short Gemini tool-calling loop
+// (like runGoalStep) until the task is done, a sensitive tool needs a
+// button tap, or the round cap is hit. Failures bump `attempts`; a task is
+// only marked failed once attempts exceed max_attempts (or the task is
+// genuinely impossible without user input).
+async function runSelfTask(task) {
+  const taskInstruction = BASE_SYSTEM_INSTRUCTION + `
+
+You are autonomously executing a self-filed background task, unattended —
+the user is not watching this turn and did not just command this. Do not
+ask questions and do not just describe what you would do — actually call
+the tool(s) that do the work (web_search, read_webpage, GitHub, Railway,
+Google, memory, custom tools, etc.). Use read-only tools freely to gather
+what you need; for anything that would send/create/delete/change real
+things, queue the confirmation button and stop this task there (the
+system handles resuming it after the user taps).
+
+Task title: "${task.title}"
+Task details: ${task.description || "(none)"}`;
+
+  let contents = [{ role: "user", parts: [{ text: `Execute this self-task now: ${task.title}${task.description ? `\n\n${task.description}` : ""}` }] }];
+  const MAX_ROUNDS = 8;
+  const selfTaskContext = { selfTaskId: task.id, title: task.title };
+
+  for (let i = 0; i < MAX_ROUNDS; i++) {
+    let data;
+    try {
+      data = await callGemini(contents, taskInstruction);
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
+    if (data.error) return { ok: false, reason: data.error.message || JSON.stringify(data.error) };
+
+    const parts = data.candidates?.[0]?.content?.parts || [];
+    const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
+    const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
+
+    if (functionCalls.length === 0) {
+      return { ok: true, summary: textReply || "Done." };
+    }
+
+    contents.push({ role: "model", parts });
+    const responseParts = [];
+    let hitConfirmation = false;
+    for (const fc of functionCalls) {
+      const result = await executeFunctionCall(fc, selfTaskContext);
+      if (result && result.status === "pending_confirmation") hitConfirmation = true;
+      responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
+    }
+    contents.push({ role: "user", parts: responseParts });
+
+    if (hitConfirmation) return { ok: null, needsConfirmation: true };
+  }
+  return { ok: true, summary: "Task actions completed." };
+}
+
+// Fire-and-forget wrapper with a tracking set so a restart/stall can't
+// double-run the same self-task from two loops at once.
+function kickOffSelfTask(taskId) {
+  if (TRACKED_SELF_TASKS.has(taskId)) return;
+  TRACKED_SELF_TASKS.add(taskId);
+  (async () => {
+    try {
+      const { data: task } = await supabase.from("agent_self_tasks").select("*").eq("id", taskId).maybeSingle();
+      if (!task || task.status !== "pending") return;
+
+      await supabase.from("agent_self_tasks").update({ status: "in_progress" }).eq("id", taskId);
+      const result = await runSelfTask(task);
+
+      if (result.needsConfirmation) {
+        await bot.sendMessage(CHAT_ID, `⏸️ Self-task "${task.title}" needs your confirmation before I continue (button above 👆).`);
+        await sendConfirmationButtons();
+        await supabase.from("agent_self_tasks").update({ status: "pending", not_before: new Date(Date.now() + 30 * 60 * 1000).toISOString() }).eq("id", taskId);
+        return;
+      }
+
+      if (result.ok === false) {
+        const attempts = (task.attempts || 0) + 1;
+        if (attempts >= (task.max_attempts || 3)) {
+          await supabase.from("agent_self_tasks").update({ status: "failed", attempts, last_error: (result.reason || "").slice(0, 500), updated_at: new Date().toISOString() }).eq("id", taskId);
+          console.error(`🤖 Self-task "${task.title}" permanently failed after ${attempts} attempts: ${result.reason}`);
+          try {
+            await bot.sendMessage(CHAT_ID, `⚠️ Self-task "${task.title}" failed after retries: ${String(result.reason).slice(0, 200)}.`);
+          } catch (_) {}
+        } else {
+          await supabase.from("agent_self_tasks").update({ status: "pending", attempts, last_error: (result.reason || "").slice(0, 500), not_before: new Date(Date.now() + 15 * 60 * 1000).toISOString(), updated_at: new Date().toISOString() }).eq("id", taskId);
+          console.log(`🤖 Self-task "${task.title}" failed (attempt ${attempts}) — retrying later: ${result.reason}`);
+        }
+        return;
+      }
+
+      // done
+      const summary = (result.summary || "").slice(0, 800);
+      const patch = { status: "done", attempts: (task.attempts || 0) + 1, result_summary: summary, updated_at: new Date().toISOString() };
+      if (task.recurrence) {
+        // repeating self-task: schedule the next occurrence instead of ending it
+        const base = task.recurrence === "daily" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+        patch.not_before = new Date(Date.now() + base).toISOString();
+        patch.status = "pending";
+      }
+      await supabase.from("agent_self_tasks").update(patch).eq("id", taskId);
+      if (summary) {
+        try { await bot.sendMessage(CHAT_ID, `🤖 Self-task "${task.title}":\n${summary}`); } catch (_) {}
+      } else {
+        console.log(`🤖 Self-task "${task.title}" done.`);
+      }
+    } catch (e) {
+      console.error("kickOffSelfTask error:", e.message);
+    } finally {
+      TRACKED_SELF_TASKS.delete(taskId);
+    }
+  })();
+}
+
+// Picks up every due pending self-task and kicks it off. Called each
+// autonomous tick and on a short safety-net interval (for restarts).
+async function processSelfTasksDue() {
+  try {
+    const { data: due } = await supabase
+      .from("agent_self_tasks")
+      .select("id")
+      .eq("status", "pending")
+      .lte("not_before", new Date().toISOString())
+      .order("priority", { ascending: false })
+      .limit(5);
+    if (!due || due.length === 0) return;
+    for (const t of due) kickOffSelfTask(t.id);
+  } catch (e) {
+    console.error("processSelfTasksDue error:", e.message);
+  }
+}
+
+// Safety net — if Railway restarts mid-self-task, nothing drives the queue
+// until the next tick; this short interval resumes it.
+setInterval(() => {
+  processSelfTasksDue().catch((e) => console.error("self-task resumer error:", e.message));
+}, 60000);
+
 
 // (CHANGED) This used to ping the user every 30s asking them to go do the
 // next goal step themselves and reply "ok"/"skip" — the opposite of
@@ -5067,11 +5523,14 @@ third person, no markdown.`;
 
 // ---- autonomous thinking tick (every 7 min) ----
 const AUTONOMOUS_SYSTEM_INSTRUCTION = `You are Night Agent's autonomous
-background process, running silently every ~7 minutes even when the user
-isn't actively chatting — this is your self-study time. Decide if there's
-anything worth proactively doing right now, based on the context you're
-given. You may take several actions in a row this tick if needed, then
-stop. You have the full tool set, including create/update/delete on
+background process, running silently every few minutes even when the user
+isn't actively chatting. You are TRULY autonomous — you actively work
+your own self-task queue (file new self-tasks with create_self_task when
+you spot useful work, and the system executes them with the full tool
+set), and you keep the user's world tidy on your own clock. Decide if
+there's anything worth proactively doing right now, based on the context
+you're given. You may take several actions in a row this tick if needed,
+then stop. You have the full tool set, including create/update/delete on
 Calendar, Gmail, Drive, and Contacts — every one of those is button-gated
 (the user gets a Yes/No tap in Telegram before anything real actually
 happens), so it's safe to queue one whenever you have a good reason. Use
@@ -5127,28 +5586,50 @@ Good reasons to act:
   rough 20-hour silence window — if you already sent a check-in message
   recently (visible in the recent conversation above), don't send another
   one just because this tick also qualifies.
+- (NEW) Proactive self-started work: if a fact, thread, event, or the
+  user's known interests point at something worth researching, preparing,
+  or following up on — file it with create_self_task so the queue executes
+  it, instead of just noting it and doing nothing. The system runs your
+  queue automatically each tick; a self-task you file now with no
+  not_before is due immediately and will start on the NEXT tick.
 
 NEVER call send_gmail during this autonomous review — sending email only
 happens in direct response to the user explicitly asking, in the moment.
 
-Be conservative — most ticks, there is nothing worth doing. Don't repeat a
-nudge about the same thing recently (check recent conversation first). When
-completely done acting this tick (including doing nothing), your FINAL
-reply must be exactly: NOTHING — unless you want to message the user right
-now, in which case your final reply is that short warm message instead.
+You are genuinely autonomous — actively seek out work (use read tools and
+web_search to build awareness, file self-tasks, continue stale goals,
+prepare useful things) rather than sitting idle waiting for a trigger.
+Still, don't spam: don't repeat a nudge about the same thing recently
+(check recent conversation first), and don't message the user just for the
+sake of it — send a message only when there's real news worth their
+attention. When completely done acting this tick (including doing nothing),
+your FINAL reply must be exactly: NOTHING — unless you want to message the
+user right now, in which case your final reply is that short warm message
+instead.
 
 You may also improve yourself during a tick: if a recurring need has no
 tool, create it with add_custom_tool; if the user recently provided a
 credential or connector, verify it with list_secrets / list_mcp_connectors.`;
 
-setInterval(autonomousTick, 7 * 60 * 1000);
+setInterval(autonomousTick, parseInt(process.env.AUTONOMOUS_INTERVAL_MINUTES || "5", 10) * 60 * 1000);
 
 async function autonomousTick() {
   if (API_KEYS.length === 0) return;
   try {
+    // (NEW) True autonomy: always work the self-task queue first — the bot
+    // executes its own filed background tasks (research, follow-ups, etc.)
+    // before deciding whether anything else worth doing came up.
+    await processSelfTasksDue();
+
+    // (NEW) AGENT_PROACTIVE=false keeps the tick working the self-task queue
+    // (and goals/reminders) but skips the proactive model-driven decision
+    // turn — no unsolicited check-ins or self-initiated research.
+    if (process.env.AGENT_PROACTIVE === "false") return;
+
     const memories = await fetchRecentMemories();
     const profile = await getUserProfile();
     const { goals } = await listActiveGoals();
+    const { tasks: selfTasks } = await listSelfTasks({ status: "pending" });
     const { events: calendarEvents } = GOOGLE_CONFIGURED ? await getCalendarEvents(3) : { events: [] };
     const { data: recentMsgs } = await supabase
       .from("bot_messages")
@@ -5180,6 +5661,12 @@ ${memories.length ? memories.map((m) => `- ${m}`).join("\n") : "none"}
 
 Active goals (each has an id you can pass to update_goal_status):
 ${goals.length ? JSON.stringify(goals) : "none"}
+
+Your pending self-tasks (the queue you filed for yourself — the system
+already kicked off any that were due BEFORE this prompt, so these are the
+ones still waiting on their not_before time; you may also file new ones
+with create_self_task if you spot work worth doing):
+${selfTasks.length ? JSON.stringify(selfTasks) : "none"}
 
 Calendar events in the next 3 days:
 ${calendarEvents.length ? JSON.stringify(calendarEvents) : "none / not connected"}
@@ -5444,6 +5931,11 @@ bot.on("callback_query", async (query) => {
         await supabase.from("goal_steps").update({ status: "skipped" }).eq("id", pc.stepId);
         kickOffGoal(pc.goalId, pc.goalTitle);
       }
+      // (NEW) If it belonged to a self-task, cancel the task itself — the
+      // user declined the action, so the self-task shouldn't keep retrying.
+      if (pc.selfTaskId) {
+        await supabase.from("agent_self_tasks").update({ status: "cancelled", updated_at: new Date().toISOString() }).eq("id", pc.selfTaskId);
+      }
       return;
     }
 
@@ -5512,6 +6004,13 @@ bot.on("callback_query", async (query) => {
         } else {
           await bot.sendMessage(CHAT_ID, `⚠️ "${pc.goalTitle}" — stopped here since that step failed. Tell me how you'd like to proceed.`);
         }
+      }
+      // (NEW) If this confirmation was blocking a self-task, the confirmed
+      // action IS the task's meaningful completion — mark it done instead
+      // of re-running the whole task (a fresh run could double-execute the
+      // just-confirmed action).
+      if (pc.selfTaskId && statusLine.startsWith("✅")) {
+        await supabase.from("agent_self_tasks").update({ status: "done", updated_at: new Date().toISOString() }).eq("id", pc.selfTaskId);
       }
       return;
     }
