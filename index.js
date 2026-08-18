@@ -233,6 +233,28 @@ function splitIntoChunks(text, maxLen) {
   return chunks;
 }
 
+function formatMessageWithEmojis(text) {
+  if (!text) return "";
+  let formatted = String(text);
+  // Break apart long paragraphs or sentences onto separate lines
+  formatted = formatted.replace(/([.!?])\s+([A-Zඅ-ෆ0-9])/g, "$1\n\n$2");
+  formatted = formatted.replace(/([,;])\s+(and|but|so|orada|එමෙන්ම|නමුත්)\s+/gi, "$1\n• ");
+  
+  // Add relevant emojis based on content keywords if not already present
+  if (!formatted.includes("🤖") && !formatted.includes("✨")) {
+    formatted = "🤖 " + formatted;
+  }
+  if (/success|done|complete|හරි|සාර්ථකයි/i.test(formatted) && !formatted.includes("✅")) {
+    formatted = "✅ " + formatted;
+  } else if (/error|fail|warning|අපහසුතාවය|වරදක්/i.test(formatted) && !formatted.includes("⚠️")) {
+    formatted = "⚠️ " + formatted;
+  } else if (/running|working|progress|ක්‍රියාත්මක/i.test(formatted) && !formatted.includes("⚙️")) {
+    formatted = "⚙️ " + formatted;
+  }
+  
+  return formatted;
+}
+
 async function sendLongMessage(chatId, text, options = {}) {
   if (!text) return;
   let content = String(text);
@@ -245,9 +267,6 @@ async function sendLongMessage(chatId, text, options = {}) {
     try {
       await bot.sendMessage(chatId, chunks[i], options);
     } catch (e) {
-      // Markdown/entity parsing can occasionally break mid-split even with
-      // the paragraph-aware cut above — fall back to plain text for that
-      // chunk instead of losing it entirely.
       console.error(`⚠️ sendLongMessage chunk ${i + 1}/${chunks.length} failed (${e.message}), retrying as plain text`);
       try {
         await bot.sendMessage(chatId, chunks[i]);
