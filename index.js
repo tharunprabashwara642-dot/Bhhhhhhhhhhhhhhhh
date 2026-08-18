@@ -4696,13 +4696,15 @@ async function executeFunctionCall(fc, goalContext) {
     
     // Live update broadcast for every tool call and background command
     try {
-      await bot.sendMessage(CHAT_ID, formatMessageWithEmojis(`⚙️ Running tool: ${fc.name}\n📋 Arguments: ${summarizeArgs(fc.args)}`));
+      const toolStartMsg = formatMessageWithEmojis(`⚙️ Working on action: ${fc.name}\n📋 Parameters: ${summarizeArgs(fc.args)}`);
+      await bot.sendMessage(CHAT_ID, toolStartMsg);
     } catch (e) {}
 
     const toolResult = await runToolDirectly(fc.name, fc.args);
 
     try {
-      await bot.sendMessage(CHAT_ID, formatMessageWithEmojis(`✅ Completed tool: ${fc.name}\n📊 Status: ${toolOutcomeTag(toolResult)}`));
+      const toolDoneMsg = formatMessageWithEmojis(`✅ Completed action: ${fc.name}\n📊 Outcome: ${toolOutcomeTag(toolResult)}`);
+      await bot.sendMessage(CHAT_ID, toolDoneMsg);
     } catch (e) {}
 
     return toolResult;
