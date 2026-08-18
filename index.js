@@ -236,6 +236,7 @@ function splitIntoChunks(text, maxLen) {
 async function sendLongMessage(chatId, text, options = {}) {
   if (!text) return;
   let content = String(text);
+  content = formatMessageWithEmojis(content);
   if (content.length > TELEGRAM_ABSOLUTE_CAP) {
     content = content.slice(0, TELEGRAM_ABSOLUTE_CAP) + "\n\n… (response truncated — ask me for more detail on any part)";
   }
