@@ -4699,11 +4699,6 @@ async function executeFunctionCall(fc, goalContext) {
       confirmationCounter++;
       const id = String(confirmationCounter);
       const description = describeAction(fc.name, fc.args);
-      // goalContext (goalId/stepId/title) is only set when this call came
-      // from runGoalStep, i.e. mid-autonomous-goal-execution. Carrying it on
-      // the pending confirmation lets the confirm/cancel callback resume the
-      // rest of the goal's steps afterwards instead of the goal silently
-      // stalling until the next 7-minute autonomousTick.
       pendingConfirmations.push({
         id, toolName: fc.name, args: fc.args || {}, description, buttonsSent: false,
         goalId: goalContext?.goalId || null,
@@ -4715,8 +4710,23 @@ async function executeFunctionCall(fc, goalContext) {
         note: "A Yes/No button has been queued for the user in Telegram. This action will only run if they tap Confirm — do not tell them it's done yet.",
       };
     }
-    return await runToolDirectly(fc.name, fc.args);
+    
+    // Live update broadcast for every tool call and background command
+    try {
+      await bot.sendMessage(CHAT_ID, formatMessageWithEmojis(`⚙️ Running tool: ${fc.name}\n📋 Arguments: ${summarizeArgs(fc.args)}`));
+    } catch (e) {}
+
+    const toolResult = await runToolDirectly(fc.name, fc.args);
+
+    try {
+      await bot.sendMessage(CHAT_ID, formatMessageWithEmojis(`✅ Completed tool: ${fc.name}\n📊 Status: ${toolOutcomeTag(toolResult)}`));
+    } catch (e) {}
+
+    return toolResult;
   } catch (e) {
+    try {
+      await bot.sendMessage(CHAT_ID, formatMessageWithEmojis(`⚠️ Tool failed: ${fc.name}\n❌ Error: ${e.message}`));
+    } catch (err) {}
     return { error: true, message: e.message };
   }
 }
