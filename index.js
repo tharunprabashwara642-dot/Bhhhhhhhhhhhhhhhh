@@ -236,23 +236,24 @@ function splitIntoChunks(text, maxLen) {
 function formatMessageWithEmojis(text) {
   if (!text) return "";
   let formatted = String(text);
-  // Break apart long paragraphs or sentences onto separate lines
-  formatted = formatted.replace(/([.!?])\s+([A-Zඅ-ෆ0-9])/g, "$1\n\n$2");
-  formatted = formatted.replace(/([,;])\s+(and|but|so|orada|එමෙන්ම|නමුත්)\s+/gi, "$1\n• ");
   
-  // Add relevant emojis based on content keywords if not already present
-  if (!formatted.includes("🤖") && !formatted.includes("✨")) {
-    formatted = "🤖 " + formatted;
-  }
-  if (/success|done|complete|හරි|සාර්ථකයි/i.test(formatted) && !formatted.includes("✅")) {
-    formatted = "✅ " + formatted;
-  } else if (/error|fail|warning|අපහසුතාවය|වරදක්/i.test(formatted) && !formatted.includes("⚠️")) {
-    formatted = "⚠️ " + formatted;
-  } else if (/running|working|progress|ක්‍රියාත්මක/i.test(formatted) && !formatted.includes("⚙️")) {
-    formatted = "⚙️ " + formatted;
-  }
+  // Format each sentence/clause onto separate lines with appropriate emojis
+  const sentences = formatted.split(/(?<=[.!?])\s+/);
+  const formattedLines = sentences.map((sentence, index) => {
+    let emoji = "🤖";
+    if (index === 0) emoji = "✨";
+    else if (index % 2 === 1) emoji = "💬";
+    else emoji = "📌";
+    
+    if (/success|done|complete|හරි|සාර්ථಕයි/i.test(sentence)) emoji = "✅";
+    else if (/error|fail|warning|අපහසුතාවය|වරදක්/i.test(sentence)) emoji = "⚠️";
+    else if (/running|working|progress|ක්‍රියාත්මක/i.test(sentence)) emoji = "⚙️";
+    else if (/calendar|date|time|කාලසටහන/i.test(sentence)) emoji = "📅";
+    
+    return `${emoji} ${sentence.trim()}`;
+  });
   
-  return formatted;
+  return formattedLines.join("\n\n");
 }
 
 async function sendLongMessage(chatId, text, options = {}) {
