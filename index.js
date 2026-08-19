@@ -1636,8 +1636,89 @@ async function fetchWithTimeout(url, options, timeoutMs = 45000) {
 }
 
 // ============================================================
-// MCP CLIENT MANAGER
+// SKILLS LOADING ENGINE (New)
 // ============================================================
+const activeSkillsCache = new Map();
+
+async function loadActiveSkillsIntoMemory() {
+  try {
+    const { data, error } = await supabase.from("skills").select("*").eq("enabled", true);
+    if (error) return;
+    activeSkillsCache.clear();
+    for (const s of (data || [])) {
+      activeSkillsCache.set(s.name, s.instructions);
+    }
+  } catch (e) {
+    console.error("loadActiveSkillsIntoMemory error:", e.message);
+  }
+}
+loadActiveSkillsIntoMemory();
+
+// Recursively find all .md files in a GitHub repo tree
+async function scanRepoForSkillMarkdownFiles(repo, path = "") {
+  const tree = await getGithubRepoTree(repo, path);
+  if (tree.error || !tree.entries) return [];
+  
+  let mdFiles = [];
+  for (const entry of tree.entries) {
+    if (entry.type === "file" && entry.name.toLowerCase().endsWith(".md")) {
+      mdFiles.push(entry.path);
+    } else if (entry.type === "dir") {
+      const subFiles = await scanRepoForSkillMarkdownFiles(repo, entry.path);
+      mdFiles.push(...subFiles);
+    }
+  }
+  return mdFiles;
+}
+
+// Tool to discover skills in a repo and present them to the user for confirmation
+async function discover_repo_skills(repo) {
+  const mdPaths = await scanRepoForSkillMarkdownFiles(repo);
+  if (mdPaths.length === 0) {
+    return { found: false, message: `No .md files found in repo "${repo}".` };
+  }
+  
+  // Return list of discovered SKILL.md/markdown paths for button confirmation
+  return {
+    found: true,
+    repo,
+    available_skills: mdPaths,
+    note: "Discovered markdown instruction files in the repo. Use install_repo_skill with the exact path to install and enable one."
+  };
+}
+
+// Tool to parse a selected SKILL.md file and save it to the skills table
+async function install_repo_skill(repo, path) {
+  const fileData = await getGithubFileContent(repo, path);
+  if (fileData.error) {
+    return { installed: false, reason: fileData.message };
+  }
+  
+  const content = fileData.content;
+  // Simple frontmatter or header parsing for skill name & description
+  let name = path.split("/").pop().replace(/\.md$/i, "");
+  let description = `Loaded from ${repo}:${path}`;
+  
+  const lines = content.split("\n");
+  if (lines.length > 0 && lines[0].startsWith("#")) {
+    name = lines[0].replace(/^#\s*/, "").trim() || name;
+  }
+  
+  const { error } = await supabase.from("skills").upsert({
+    name,
+    description,
+    instructions: content,
+    enabled: true,
+    created_at: new Date().toISOString()
+  });
+  
+  if (error) {
+    return { installed: false, reason: error.message };
+  }
+  
+  await loadActiveSkillsIntoMemory();
+  return { installed: true, skill_name: name, path, note: `Skill "${name}" successfully saved to skills table and injected into system instructions.` };
+}
 // @modelcontextprotocol/sdk is ESM-only — this file is CommonJS
 // (require-based), so it's loaded with a dynamic import() instead of
 // require(). Add it with: npm install @modelcontextprotocol/sdk
