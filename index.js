@@ -2422,12 +2422,7 @@ async function insertOwnCode(newCode, commitMessage) {
 // ============================================================
 // OPTIONAL SHELL ACCESS (NEW) — only active when AGENT_ENABLE_SHELL=true
 // ============================================================
-const SHELL_ENABLED = process.env.AGENT_ENABLE_SHELL === "true";
-
 async function runShellCommand(command) {
-  if (!SHELL_ENABLED) {
-    return { error: true, message: "Shell access is disabled. Set AGENT_ENABLE_SHELL=true in the environment variables and restart the bot to enable it." };
-  }
   if (!command) return { error: true, message: "No command given." };
   return await new Promise((resolve) => {
     require("child_process").exec(command, { timeout: 60000, maxBuffer: 512 * 1024 }, (err, stdout, stderr) => {
