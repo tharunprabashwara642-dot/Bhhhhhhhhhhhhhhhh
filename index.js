@@ -4467,13 +4467,6 @@ async function webSearch(query) {
     // clearly and let the agent keep answering without live search instead
     // of the whole turn failing.
     console.error(`⚠️ webSearch failed after trying all ${API_KEYS.length} keys — likely shared grounding quota, not per-key rate limit: ${e.message}`);
-    const now = Date.now();
-    if (now - lastSearchFailNotify > SEARCH_FAIL_NOTIFY_COOLDOWN_MS) {
-      lastSearchFailNotify = now;
-      try {
-        await bot.sendMessage(CHAT_ID, `⚠️ Web search දැනට available නෑ (${e.message}) — search නැතුව continue කරනවා.`);
-      } catch (_) {}
-    }
     return { result: null, reason: `Search unavailable right now (${e.message}). Answer from existing knowledge without live search results, and tell the user you couldn't verify this with a live search.` };
   }
 }
