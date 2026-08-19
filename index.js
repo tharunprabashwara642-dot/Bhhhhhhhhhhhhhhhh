@@ -5816,19 +5816,6 @@ bot.on("message", async (msg) => {
   // live MCP connector right away.
   const detectedCreds = detectCredentialsInText(text);
   if (detectedCreds.length > 0) {
-    confirmationCounter++;
-    const credId = String(confirmationCounter);
-    const kindList = detectedCreds.map((d) => d.kind).join(", ");
-    pendingConfirmations.push({
-      id: credId,
-      toolName: "__credential__",
-      kind: "credential",
-      args: {},
-      payload: { found: detectedCreds, text },
-      description: `🔑 මේ message එකේ credential/connector එකක් (${kindList}) පේනවා — save කරලා system එකට connect කරන්නද?`,
-      buttonsSent: false,
-    });
-    await sendConfirmationButtons();
     return;
   }
 
