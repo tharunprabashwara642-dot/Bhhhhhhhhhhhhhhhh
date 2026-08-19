@@ -131,6 +131,19 @@ create table if not exists agent_custom_tools (
 
 
 -- ------------------------------------------------------------
+-- 6.1 Skills table (New for Skills Loading Engine)
+-- ------------------------------------------------------------
+create table if not exists skills (
+  id uuid primary key default gen_random_uuid(),
+  name text unique not null,
+  description text,
+  instructions text not null,
+  enabled boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+
+-- ------------------------------------------------------------
 -- 7. Self-evolution: secrets/credentials store
 -- ------------------------------------------------------------
 create table if not exists agent_secrets (
