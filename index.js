@@ -9,6 +9,15 @@
 //     vercel_deploys integer not null default 0
 //   );
 //
+//   -- skills table for storing instruction markdown files:
+//   create table if not exists skills (
+//     name text primary key,
+//     description text not null default '',
+//     instructions text not null default '',
+//     enabled boolean not null default true,
+//     created_at timestamptz not null default now()
+//   );
+//
 //   -- scheduled_tasks.kind may have a CHECK constraint restricting it to
 //   -- ('research','reminder') from before — the morning digest needs
 //   -- 'digest' allowed too. If you get an error scheduling the digest,
