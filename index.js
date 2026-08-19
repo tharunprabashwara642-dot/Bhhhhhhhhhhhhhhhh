@@ -2008,6 +2008,10 @@ async function initMcpServers() {
         // different MCP servers (or a hardcoded tool of the same name)
         // never collide.
         const prefixedName = `mcp_${cfg.id}_${t.name}`.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 63);
+        if (mcpToolRegistry[prefixedName]) {
+          console.log(`⚠️ MCP tool duplicate skipped: ${prefixedName}`);
+          continue;
+        }
         mcpToolRegistry[prefixedName] = { serverId: cfg.id, client, originalName: t.name };
         mcpToolDeclarations.push({
           name: prefixedName,
