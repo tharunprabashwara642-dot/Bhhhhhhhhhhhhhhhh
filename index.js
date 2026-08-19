@@ -4444,7 +4444,7 @@ const SEARCH_FAIL_NOTIFY_COOLDOWN_MS = 5 * 60 * 1000;
 
 async function webSearch(query) {
   try {
-    const serpApiKey = process.env.SERPAPI_API_KEY || await getSecret("C9FF3EC1AD5685E750BD121EEADC17E_KEY") || await getSecret("FEE764202534C510B043C0AEA22040A_KEY");
+    const serpApiKey = process.env.SERPAPI_API_KEY || await getSecret("C9FF3EC1AD5685E750BD121EEADC17E_KEY") || await getSecret("FEE764202534C510B043C0AEA22040A_KEY") || await getSecret("SERPAPI_API_KEY");
     if (serpApiKey) {
       const res = await fetchWithTimeout(`https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${serpApiKey}`);
       const data = await res.json();
