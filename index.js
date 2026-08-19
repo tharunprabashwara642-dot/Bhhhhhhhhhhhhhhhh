@@ -252,11 +252,12 @@ function splitIntoChunks(text, maxLen) {
 // emoji are a signal, not decoration on every clause.
 function formatMessageWithEmojis(text) {
   if (!text) return "";
-  const formatted = String(text).trim();
+  let formatted = String(text).trim();
 
-  // Don't double-stamp a message that already opens with an emoji/status
-  // marker (e.g. the live-status renderer, or a reply that already starts
-  // with ✅/⚠️/🔧/🌙/etc.) or that's short chit-chat with no real outcome.
+  // Clean up any robotic bullet-point formatting or excessive line breaks
+  formatted = formatted.replace(/^[•\-\*]\s+/gm, "");
+  formatted = formatted.replace(/\n{3,}/g, "\n\n");
+
   const alreadyMarked = /^[\p{Emoji_Presentation}\p{Extended_Pictographic}]/u.test(formatted);
   if (alreadyMarked || formatted.length < 40) return formatted;
 
