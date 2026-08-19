@@ -5824,6 +5824,25 @@ bot.on("message", async (msg) => {
       .limit(1)
       .maybeSingle();
 
+    // ---- stats command handler ----
+    if (lower === "stats") {
+      try {
+        const usage = await getUsageStats();
+        const goalsData = await listActiveGoals();
+        const activeCount = goalsData.goals ? goalsData.goals.length : 0;
+        const msgText = `📊 *Quick Stats Summary*\n\n` +
+          `- Today's Gemini API Calls: *${usage.gemini_calls_today}*\n` +
+          `- Today's Vercel Deploys: *${usage.vercel_deploys_today}*\n` +
+          `- Active Goals: *${activeCount}*\n` +
+          `- Active Gemini Keys: *${usage.gemini_keys_active}*`;
+        await sendLongMessage(CHAT_ID, msgText);
+        await logBotMessage("agent", msgText);
+      } catch (err) {
+        await bot.sendMessage(CHAT_ID, `⚠️ Stats ගෙන්නගන්නකොට error එකක් ආවා: ${err.message}`);
+      }
+      return;
+    }
+
     if (waiting && YES_WORDS.includes(lower)) {
       await supabase.from("goal_steps").update({ status: "done" }).eq("id", waiting.id);
       await maybeCompleteGoal(waiting.goal_id, waiting.goals.title);
