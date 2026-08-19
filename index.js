@@ -4917,287 +4917,190 @@ async function handleChatMessage(userText) {
   if (API_KEYS.length === 0) {
     return "⚠️ No Gemini API keys configured.";
   }
-  
-  try {
-    const memories = await fetchRecentMemories();
-    const profile = await getUserProfile();
-    
-    let systemInstruction = BASE_SYSTEM_INSTRUCTION;
-    const now = nowInTimezone();
-    // Ground the model in the real current date/time on every message —
-    // don't rely on it remembering to call get_current_datetime before
-    // computing a relative date like "tomorrow" or "next week". Missing
-    // that call was the cause of reminders landing on the wrong day.
-    systemInstruction += `\n\nCurrent date/time right now: ${now.readable} (ISO: ${now.iso}, timezone ${TIMEZONE}).
+
+  let attempt = 0;
+  const maxAttempts = 5;
+  let lastError = null;
+
+  while (attempt < maxAttempts) {
+    attempt++;
+    try {
+      const memories = await fetchRecentMemories();
+      const profile = await getUserProfile();
+      
+      let systemInstruction = BASE_SYSTEM_INSTRUCTION;
+      const now = nowInTimezone();
+      systemInstruction += `\n\nCurrent date/time right now: ${now.readable} (ISO: ${now.iso}, timezone ${TIMEZONE}).
 When the user says something relative — "tomorrow", "tonight", "next
 Monday", "in 2 hours", "in 3 days" — compute the exact run_at yourself
 from THIS current date/time, not from any date you might otherwise
 assume. Always include the +05:30 offset in run_at.`;
-    if (profile) {
-      systemInstruction += `\n\nUser profile: ${profile}`;
-    }
-    if (memories.length > 0) {
-      systemInstruction += `\n\nSaved facts:\n- ` + memories.join("\n- ");
-    }
-
-    if (activeSkillsCache.size > 0) {
-      systemInstruction += `\n\nAvailable Skills & Rules:\n`;
-      for (const [skillName, skillInstructions] of activeSkillsCache.entries()) {
-        systemInstruction += `\n--- Skill: ${skillName} ---\n${skillInstructions}\n`;
+      if (profile) {
+        systemInstruction += `\n\nUser profile: ${profile}`;
       }
-    }
+      if (memories.length > 0) {
+        systemInstruction += `\n\nSaved facts:\n- ` + memories.join("\n- ");
+      }
 
-    // bring in recent conversation turns so follow-up questions work —
-    // the current userText was already logged to bot_messages by the
-    // caller before this ran, so drop that trailing duplicate here
-    const history = await fetchRecentConversation();
-    if (history.length > 0) {
-      const last = history[history.length - 1];
-      if (last.role === "user" && last.content === userText) history.pop();
-    }
-    let contents = history.map((m) => ({
-      role: m.role === "agent" ? "model" : "user",
-      parts: [{ text: m.content }],
-    }));
-    contents.push({ role: "user", parts: [{ text: userText }] });
+      if (activeSkillsCache.size > 0) {
+        systemInstruction += `\n\nAvailable Skills & Rules:\n`;
+        for (const [skillName, skillInstructions] of activeSkillsCache.entries()) {
+          systemInstruction += `\n--- Skill: ${skillName} ---\n${skillInstructions}\n`;
+        }
+      }
 
-    // Tracks whether create_task_list was actually called (and actually
-    // succeeded) somewhere in this turn's loop — the old code just printed
-    // "I'll register it as a goal" as a hardcoded string with NO check that
-    // a goal was ever created, so the autonomous tick had nothing to pick
-    // up and the promised follow-up silently never happened.
-    let goalRegistered = false;
+      const history = await fetchRecentConversation();
+      if (history.length > 0) {
+        const last = history[history.length - 1];
+        if (last.role === "user" && last.content === userText) history.pop();
+      }
+      let contents = history.map((m) => ({
+        role: m.role === "agent" ? "model" : "user",
+        parts: [{ text: m.content }],
+      }));
+      contents.push({ role: "user", parts: [{ text: userText }] });
 
-    // (NEW) Proactive progress check-ins — if a task needs multiple tool
-    // rounds, ping Telegram periodically with what's currently happening
-    // instead of staying completely silent until the whole loop finishes.
-    // Timer only starts once the loop is confirmed to need a 2nd round, and
-    // is always cleared in the `finally` below regardless of which return
-    // path is taken.
-    const CHECKIN_INTERVAL_MS = parseInt(process.env.AGENT_CHECKIN_INTERVAL_MS || "35000", 10);
-    let checkinTimer = null;
-    let currentStepLabel = "starting";
+      let goalRegistered = false;
+      const CHECKIN_INTERVAL_MS = parseInt(process.env.AGENT_CHECKIN_INTERVAL_MS || "35000", 10);
+      let checkinTimer = null;
+      let currentStepLabel = "starting";
 
-    // (NEW) Action-intent guard — catches the failure mode where the model
-    // describes what it WOULD do (or dumps links/a plan) instead of actually
-    // calling a tool. Cheap/fast models especially like to "answer" a
-    // build/deploy/send request in prose rather than invoking the tool that
-    // does the real work. We only force ONE retry, only on the very first
-    // round, and only when the user's own wording clearly asked for an
-    // action — this avoids nagging the model on genuine Q&A turns.
-    const ACTION_INTENT_RE = /\b(deploy|build|create|make|host|send|schedule|save|delete|update|add|fork|redeploy|generate)\b/i;
-    // (FIX) ACTION_INTENT_RE only matched English keywords, so a Sinhala
-    // voice/text request (e.g. "කේත එක වෙනස් කරගන්න" — "go change the
-    // code") never tripped the forced-retry safety net below. The model
-    // was then free to reply with plain text like "මම දැන්ම කරන්නම් බොස්"
-    // ("I'll do it right now boss") without ever calling a tool — no tool
-    // call means no confirmation button and no live status message, so it
-    // looked like the bot was just ignoring the request in the background.
-    const SINHALA_ACTION_WORDS = [
-      "වෙනස්", "කරගන්න", "කරන්න", "හදන්න", "හදාගන්න", "යාවත්කාලීන",
-      "අප්ඩේට්", "යවන්න", "එවන්න", "මකන්න", "අයින් කරන්න", "සුරකින්න",
-      "සේව්", "ඩිප්ලෝයි", "සාදන්න", "බිල්ඩ්", "දාන්න", "දාලා", "එකතු කරන්න",
-    ];
-    function hasActionIntent(text) {
-      if (ACTION_INTENT_RE.test(text)) return true;
-      return SINHALA_ACTION_WORDS.some((w) => text.includes(w));
-    }
-    let forcedActionRetry = false;
+      const ACTION_INTENT_RE = /\b(deploy|build|create|make|host|send|schedule|save|delete|update|add|fork|redeploy|generate)\b/i;
+      const SINHALA_ACTION_WORDS = [
+        "වෙනස්", "කරගන්න", "කරන්න", "හදන්න", "හදාගන්න", "යාවත්කාලීන",
+        "අප්ඩේට්", "යවන්න", "එවන්න", "මකන්න", "අයින් කරන්න", "සුරකින්න",
+        "සේව්", "ඩිප්ලෝයි", "සාදන්න", "බිල්ඩ්", "දාන්න", "දාලා", "එකතු කරන්න",
+      ];
+      function hasActionIntent(text) {
+        if (ACTION_INTENT_RE.test(text)) return true;
+        return SINHALA_ACTION_WORDS.some((w) => text.includes(w));
+      }
+      let forcedActionRetry = false;
 
-    // (NEW) Live activity status — a single Telegram message that gets
-    // edited in place as each tool call starts/finishes, so the user
-    // actually sees what the bot is doing turn by turn (Hermes/CrewAI-style
-    // trace) instead of only a generic "still working" ping every 35s.
-    let statusMsgId = null;
-    let statusLines = [];
-    let statusDone = false;
-    // (REWRITTEN) This used to render as a raw trace: "🔧 name(args) —
-    // running..." / "✅". Boss doesn't want a function-call log, he wants
-    // it to read like someone actually narrating the work as it happens
-    // — start, what's being done right now in plain words, any hiccup and
-    // that it's being handled, then a clear finish. toNarrativeLine turns
-    // one tool call into a short human sentence instead of a trace line;
-    // renderStatus keeps editing the same message start-to-finish so it
-    // reads as one continuous update, not a wall of separate pings.
-    function toNarrativeLine(fc, phase, result) {
-      const label = HUMAN_TOOL_LABELS[fc.name] || fc.name.replace(/_/g, " ");
-      if (phase === "start") return `▫️ ${label}... පටන් ගත්තා`;
-      const tag = toolOutcomeTag(result);
-      if (tag.startsWith("✅")) return `▫️ ${label} — ✅ හරි ගියා`;
-      if (tag.startsWith("⏸️")) return `▫️ ${label} — ⏸️ confirm එකක් ඕනේ`;
-      return `▫️ ${label} — ⚠️ පොඩි අවුලක් ආවා, බලන් ඉන්නවා...`;
-    }
-    async function renderStatus() {
-      const shown = statusLines.slice(-14); // keep the message from growing forever
-      const header = statusDone ? `✅ වැඩේ ඉවරයි!` : `⚙️ මන් දැන් වැඩේ කරගෙන යනවා බොස්...`;
-      const text = `${header}\n` + shown.join("\n");
+      let statusMsgId = null;
+      let statusLines = [];
+      let statusDone = false;
+      function toNarrativeLine(fc, phase, result) {
+        const label = HUMAN_TOOL_LABELS[fc.name] || fc.name.replace(/_/g, " ");
+        if (phase === "start") return `▫️ ${label}... පටන් ගත්තා`;
+        const tag = toolOutcomeTag(result);
+        if (tag.startsWith("✅")) return `▫️ ${label} — ✅ හරි ගියා`;
+        if (tag.startsWith("⏸️")) return `▫️ ${label} — ⏸️ confirm එකක් ඕනේ`;
+        return `▫️ ${label} — ⚠️ පොඩි අවුලක් ආවා, බලන් ඉන්නවා...`;
+      }
+      async function renderStatus() {
+        const shown = statusLines.slice(-14);
+        const header = statusDone ? `✅ වැඩේ ඉවරයි!` : `⚙️ මන් දැන් වැඩේ කරගෙන යනවා බොස්...`;
+        const text = `${header}\n` + shown.join("\n");
+        try {
+          if (statusMsgId === null) {
+            const sent = await bot.sendMessage(CHAT_ID, text);
+            statusMsgId = sent.message_id;
+          } else {
+            await bot.editMessageText(text, { chat_id: CHAT_ID, message_id: statusMsgId });
+          }
+        } catch (e) {}
+      }
+
+      const MAX_TOOL_ROUNDS = 10;
       try {
-        if (statusMsgId === null) {
-          const sent = await bot.sendMessage(CHAT_ID, text);
-          statusMsgId = sent.message_id;
-        } else {
-          await bot.editMessageText(text, { chat_id: CHAT_ID, message_id: statusMsgId });
-        }
-      } catch (e) {
-        // Edits can fail (identical text, rate limit, etc.) — never let a
-        // status-message hiccup break the actual tool-execution flow.
-      }
-    }
-
-    const MAX_TOOL_ROUNDS = 10; // was 6 — too easy to exhaust on a multi-step deploy-debug loop
-    try {
-      for (let i = 0; i < MAX_TOOL_ROUNDS; i++) {
-        let data;
-        let geminiOk = false;
-        // (NEW) Retry transient Gemini failures a couple of times before
-        // giving up — a single network hiccup used to dead-end the whole
-        // request immediately.
-        for (let attempt = 0; attempt < 3 && !geminiOk; attempt++) {
-          try {
-            data = await callGemini(contents, systemInstruction);
-            geminiOk = true;
-          } catch (e) {
-            console.error(`callGemini failed (attempt ${attempt + 1}/3):`, e.message);
-            if (attempt < 2) await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
-          }
-        }
-        if (!geminiOk) {
-          // Don't just dead-end the conversation — queue it as a goal so the
-          // autonomous tick keeps retrying on its own in the background.
-          const fallbackTitle = `Retry: ${userText}`.slice(0, 120);
-          const goalResult = await createTaskList(fallbackTitle, [
-            "Gemini was unreachable when this was first tried — pick it up and finish it.",
-          ]);
-          // (FIX) This used to only register the goal and then rely on the
-          // NEXT autonomousTick (up to 7 minutes later) to actually pick it
-          // up — from the chat it looked like the bot just went silent and
-          // sat there after saying it would "keep retrying". Kick it off
-          // right away in the background instead; kickOffGoal is a no-op
-          // if it's already running.
-          if (goalResult.created) kickOffGoal(goalResult.goal_id, fallbackTitle);
-          return goalResult.created
-            ? "⚠️ Gemini's not responding right now — retrying it in the background right now, not waiting for the next check-in."
-            : "⚠️ I couldn't reach Gemini right now, and couldn't even queue a retry. Please try again in a moment.";
-        }
-
-        if (data.error) {
-          return `⚠️ Gemini error: ${data.error.message || JSON.stringify(data.error)}`;
-        }
-
-        const parts = data.candidates?.[0]?.content?.parts || [];
-        const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
-        const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
-
-        if (functionCalls.length === 0) {
-          // (FIX) This used to only fire when i === 0 (the very first
-          // round), so once the model had already spent a few rounds
-          // exploring — list_github_repos, get_file_contents, search_code,
-          // etc. — and then ended a LATER round with just a text promise
-          // like "I'm preparing to make the changes now, boss" and no tool
-          // call, that promise was returned straight to the user as the
-          // final answer. Nothing had actually been written, and the user
-          // had no way to tell from the chat that the task silently died
-          // there. The retry needs to apply on ANY round, not just the
-          // first — forcedActionRetry still caps it to one nudge per turn.
-          if (!forcedActionRetry && hasActionIntent(userText)) {
-            forcedActionRetry = true;
-            contents.push({ role: "model", parts: [{ text: textReply }] });
-            contents.push({
-              role: "user",
-              parts: [{
-                text: "You replied with text instead of calling a tool, but this request needs a real action. If one of your tools actually does this (deploy_website, deploy_multipage_website, create_or_update_github_file, send_gmail, create_calendar_event, schedule_reminder, create_task_list, etc.), call it now instead of describing it or saying you're about to. If genuinely no tool applies, explain specifically why not.",
-              }],
-            });
-            continue; // one extra round, does not count against forced-retry budget
-          }
-          return textReply || "I processed your request but have no response.";
-        }
-
-        if (!checkinTimer) {
-          checkinTimer = setInterval(() => {
-            bot.sendMessage(CHAT_ID, `🔄 Still working on this — now doing: ${currentStepLabel}`)
-              .catch((e) => console.error("progress check-in send failed:", e.message));
-          }, CHECKIN_INTERVAL_MS);
-        }
-        currentStepLabel = functionCalls.map((fc) => fc.name).join(", ");
-
-        contents.push({ role: "model", parts });
-        const responseParts = [];
-        let hitConfirmation = false;
-        for (const fc of functionCalls) {
-          const lineIdx = statusLines.length;
-          statusLines.push(toNarrativeLine(fc, "start"));
-          await renderStatus();
-          let result;
-          let toolSuccess = false;
-          let attemptCount = 0;
-          const maxToolAttempts = 5;
-          while (!toolSuccess && attemptCount < maxToolAttempts) {
-            attemptCount++;
-            result = await executeFunctionCall(fc);
-            if (result && !result.error && !Object.values(result).includes(false)) {
-              toolSuccess = true;
-            } else if (attemptCount < maxToolAttempts) {
-              await new Promise(r => setTimeout(r, 1000 * attemptCount));
+        for (let i = 0; i < MAX_TOOL_ROUNDS; i++) {
+          let data;
+          let geminiOk = false;
+          for (let attempt = 0; attempt < 3 && !geminiOk; attempt++) {
+            try {
+              data = await callGemini(contents, systemInstruction);
+              geminiOk = true;
+            } catch (e) {
+              if (attempt < 2) await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
             }
           }
-          statusLines[lineIdx] = toNarrativeLine(fc, "done", result);
+          if (!geminiOk) {
+            throw new Error("Gemini unreachable");
+          }
+
+          if (data.error) {
+            throw new Error(data.error.message || JSON.stringify(data.error));
+          }
+
+          const parts = data.candidates?.[0]?.content?.parts || [];
+          const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
+          const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
+
+          if (functionCalls.length === 0) {
+            if (!forcedActionRetry && hasActionIntent(userText)) {
+              forcedActionRetry = true;
+              contents.push({ role: "model", parts: [{ text: textReply }] });
+              contents.push({
+                role: "user",
+                parts: [{
+                  text: "You replied with text instead of calling a tool, but this request needs a real action. If one of your tools actually does this, call it now instead of describing it.",
+                }],
+              });
+              continue;
+            }
+            return textReply || "I processed your request but have no response.";
+          }
+
+          if (!checkinTimer) {
+            checkinTimer = setInterval(() => {
+              bot.sendMessage(CHAT_ID, `🔄 වැඩේ දිගටම යනවා — දැන් කරන්නේ: ${currentStepLabel}`)
+                .catch((e) => {});
+            }, CHECKIN_INTERVAL_MS);
+          }
+          currentStepLabel = functionCalls.map((fc) => fc.name).join(", ");
+
+          contents.push({ role: "model", parts });
+          const responseParts = [];
+          let hitConfirmation = false;
+          for (const fc of functionCalls) {
+            const lineIdx = statusLines.length;
+            statusLines.push(toNarrativeLine(fc, "start"));
+            await renderStatus();
+            let result;
+            let toolSuccess = false;
+            let attemptCount = 0;
+            const maxToolAttempts = 5;
+            while (!toolSuccess && attemptCount < maxToolAttempts) {
+              attemptCount++;
+              result = await executeFunctionCall(fc);
+              if (result && !result.error && !Object.values(result).includes(false)) {
+                toolSuccess = true;
+              } else if (attemptCount < maxToolAttempts) {
+                await new Promise(r => setTimeout(r, 1000 * attemptCount));
+              }
+            }
+            statusLines[lineIdx] = toNarrativeLine(fc, "done", result);
+            await renderStatus();
+            if (result && result.status === "pending_confirmation") hitConfirmation = true;
+            if (fc.name === "create_task_list" && result && result.created) goalRegistered = true;
+            responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
+          }
+          contents.push({ role: "user", parts: responseParts });
+
+          if (hitConfirmation) {
+            await sendConfirmationButtons();
+            return "⏸️ Waiting for your confirmation — tap the button above before I continue.";
+          }
+        }
+        return "මෙහෙයුම සම්පූර්ණයි බොස්.";
+      } finally {
+        if (checkinTimer) clearInterval(checkinTimer);
+        if (statusMsgId !== null) {
+          statusDone = true;
           await renderStatus();
-          if (result && result.status === "pending_confirmation") hitConfirmation = true;
-          if (fc.name === "create_task_list" && result && result.created) goalRegistered = true;
-          responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
-        }
-        contents.push({ role: "user", parts: responseParts });
-
-        // (FIX) A sensitive tool (update_own_code, run_shell_command, etc.)
-        // got queued behind a Yes/No button here — previously this loop
-        // just kept going (or ended with a generic reply) and the button
-        // itself was NEVER sent, because sendConfirmationButtons() was only
-        // wired up in the goal-execution and autonomous-tick paths, not in
-        // this direct chat handler. The confirmation sat in memory forever
-        // with nothing shown in Telegram, so the model's "I'll do it now"
-        // reply was never actually followed by real action or any visible
-        // button — it just looked like nothing happened.
-        if (hitConfirmation) {
-          await sendConfirmationButtons();
-          return "⏸️ Waiting for your confirmation — tap the button above before I continue.";
         }
       }
-
-      // We hit the round limit without a final text reply. Don't just claim a
-      // goal was registered — actually register one now if it wasn't already,
-      // so the 7-min autonomous tick genuinely has something to continue.
-      if (goalRegistered) {
-        return "Still working through this — I've registered it as a goal and will follow up automatically in a few minutes.";
-      }
-
-      const fallbackTitle = `Continue: ${userText}`.slice(0, 120);
-      const goalResult = await createTaskList(fallbackTitle, [
-        "Pick up where the last chat turn left off and finish the task.",
-      ]);
-      if (goalResult.created) {
-        // (FIX) Same "sat there waiting" bug as above — start working on
-        // it immediately instead of leaving it for the next autonomous
-        // tick, which could be up to 7 minutes away.
-        kickOffGoal(goalResult.goal_id, fallbackTitle);
-        return "Still working through this — continuing right now in the background, not waiting for the next check-in.";
-      }
-      console.error("Fallback createTaskList failed:", goalResult.reason);
-      return `⚠️ Still working through this, and I wasn't able to register it as a goal either (${goalResult.reason || "unknown error"}). Please ask me to continue and I'll try again.`;
-    } finally {
-      if (checkinTimer) clearInterval(checkinTimer);
-      // (NEW) Flip the live-status message to a clear "done" state on the
-      // way out, whatever the outcome — so it never just stops mid-trace
-      // looking unfinished; the final reply follows as its own message.
-      if (statusMsgId !== null) {
-        statusDone = true;
-        await renderStatus();
+    } catch (e) {
+      lastError = e;
+      console.error(`Attempt ${attempt} failed:`, e.message);
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
       }
     }
-  } catch (e) {
-    console.error("handleChatMessage error:", e);
-    return "⚠️ Something went wrong processing your request.";
   }
+
+  return `⚠️ දෝෂයක් මතු වුණා: ${lastError ? lastError.message : "unknown error"}. උත්සාහයන් ${maxAttempts}ක්ම අසාර්ථකයි බොස්.`;
 }
 
 // ============================================================
