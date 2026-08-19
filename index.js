@@ -4929,6 +4929,13 @@ assume. Always include the +05:30 offset in run_at.`;
       systemInstruction += `\n\nSaved facts:\n- ` + memories.join("\n- ");
     }
 
+    if (activeSkillsCache.size > 0) {
+      systemInstruction += `\n\nAvailable Skills & Rules:\n`;
+      for (const [skillName, skillInstructions] of activeSkillsCache.entries()) {
+        systemInstruction += `\n--- Skill: ${skillName} ---\n${skillInstructions}\n`;
+      }
+    }
+
     // bring in recent conversation turns so follow-up questions work —
     // the current userText was already logged to bot_messages by the
     // caller before this ran, so drop that trailing duplicate here
