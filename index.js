@@ -5128,7 +5128,19 @@ assume. Always include the +05:30 offset in run_at.`;
           const lineIdx = statusLines.length;
           statusLines.push(toNarrativeLine(fc, "start"));
           await renderStatus();
-          const result = await executeFunctionCall(fc);
+          let result;
+          let toolSuccess = false;
+          let attemptCount = 0;
+          const maxToolAttempts = 5;
+          while (!toolSuccess && attemptCount < maxToolAttempts) {
+            attemptCount++;
+            result = await executeFunctionCall(fc);
+            if (result && !result.error && !Object.values(result).includes(false)) {
+              toolSuccess = true;
+            } else if (attemptCount < maxToolAttempts) {
+              await new Promise(r => setTimeout(r, 1000 * attemptCount));
+            }
+          }
           statusLines[lineIdx] = toNarrativeLine(fc, "done", result);
           await renderStatus();
           if (result && result.status === "pending_confirmation") hitConfirmation = true;
