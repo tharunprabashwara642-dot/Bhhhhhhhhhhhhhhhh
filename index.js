@@ -4444,6 +4444,16 @@ const SEARCH_FAIL_NOTIFY_COOLDOWN_MS = 5 * 60 * 1000;
 
 async function webSearch(query) {
   try {
+    const serpApiKey = process.env.SERPAPI_API_KEY || await getSecret("C9FF3EC1AD5685E750BD121EEADC17E_KEY") || await getSecret("FEE764202534C510B043C0AEA22040A_KEY");
+    if (serpApiKey) {
+      const res = await fetchWithTimeout(`https://serpapi.com/search.json?q=${encodeURIComponent(query)}&api_key=${serpApiKey}`);
+      const data = await res.json();
+      if (data.organic_results && data.organic_results.length > 0) {
+        const snippets = data.organic_results.slice(0, 3).map(r => r.snippet).join(" ");
+        return { result: snippets };
+      }
+    }
+
     const data = await fetchGeminiRotating(
       (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${key}`,
       {
@@ -4460,14 +4470,8 @@ async function webSearch(query) {
     const text = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
     return { result: text || "No useful results found." };
   } catch (e) {
-    // (NEW) fetchGeminiRotating already tried every key in the pool before
-    // throwing here — if grounding is out of quota on all of them, that's
-    // very likely a project-level grounding quota (shared across keys on
-    // the same Google Cloud project), not a per-key RPM issue. Log it
-    // clearly and let the agent keep answering without live search instead
-    // of the whole turn failing.
-    console.error(`⚠️ webSearch failed after trying all ${API_KEYS.length} keys — likely shared grounding quota, not per-key rate limit: ${e.message}`);
-    return { result: null, reason: `Search unavailable right now (${e.message}). Answer from existing knowledge without live search results, and tell the user you couldn't verify this with a live search.` };
+    console.error(`⚠️ webSearch failed: ${e.message}`);
+    return { result: null, reason: `Search unavailable right now (${e.message}).` };
   }
 }
 
