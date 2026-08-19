@@ -1704,7 +1704,6 @@ async function install_repo_skill(repo, path) {
   }
   
   const content = fileData.content;
-  // Simple frontmatter or header parsing for skill name & description
   let name = path.split("/").pop().replace(/\.md$/i, "");
   let description = `Loaded from ${repo}:${path}`;
   
