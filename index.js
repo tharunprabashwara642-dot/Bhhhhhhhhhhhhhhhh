@@ -2439,13 +2439,28 @@ async function insertOwnCode(newCode, commitMessage) {
 async function runShellCommand(command) {
   if (!command) return { error: true, message: "No command given." };
   return await new Promise((resolve) => {
-    require("child_process").exec(command, { timeout: 60000, maxBuffer: 512 * 1024 }, (err, stdout, stderr) => {
+    require("child_process").exec(command, { timeout: 60000, maxBuffer: 512 * 1024 }, async (err, stdout, stderr) => {
+      const out = String(stdout || "").trim();
+      const errOut = String(stderr || "").trim();
+      let termOutput = `💻 *Terminal Output*\n\`\`\`bash\n$ ${command}\n`;
+      if (out) termOutput += `${out}\n`;
+      if (errOut) termOutput += `stderr:\n${errOut}\n`;
+      if (!out && !errOut && !err) termOutput += `(command executed successfully with no output)\n`;
+      if (err) termOutput += `exit code: ${err.code}\n`;
+      termOutput += `\`\`\``;
+      
+      try {
+        await sendLongMessage(CHAT_ID, termOutput);
+      } catch (e) {
+        console.error("Failed to send terminal output to chat:", e.message);
+      }
+
       resolve({
         command,
         ok: !err,
         exit_code: err ? err.code : 0,
-        stdout: String(stdout || "").slice(0, 6000),
-        stderr: String(stderr || "").slice(0, 4000),
+        stdout: out,
+        stderr: errOut,
       });
     });
   });
