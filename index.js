@@ -5011,7 +5011,7 @@ assume. Always include the +05:30 offset in run_at.`;
         const tag = toolOutcomeTag(result);
         if (tag.startsWith("✅")) return `▫️ ${label} — ✅ හරි ගියා`;
         if (tag.startsWith("⏸️")) return `▫️ ${label} — ⏸️ confirm එකක් ඕනේ`;
-        return `▫️ ${label} — ⚠️ පොඩි අවුලක් ආවා, බලන් ඉන්නවා...`;
+        return `▫️ ${label} — ⚠️ පොඩි අවුලක් ආවා, වෙනස් විදිහකට ට්‍රයි කරනවා...`;
       }
       async function renderStatus() {
         const shown = statusLines.slice(-14);
@@ -5028,92 +5028,133 @@ assume. Always include the +05:30 offset in run_at.`;
       }
 
       const MAX_TOOL_ROUNDS = 10;
-      try {
-        for (let i = 0; i < MAX_TOOL_ROUNDS; i++) {
-          let data;
-          let geminiOk = false;
-          for (let attempt = 0; attempt < 3 && !geminiOk; attempt++) {
-            try {
-              data = await callGemini(contents, systemInstruction);
-              geminiOk = true;
-            } catch (e) {
-              if (attempt < 2) await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
-            }
-          }
-          if (!geminiOk) {
-            throw new Error("Gemini unreachable");
-          }
+      let attemptLoopCount = 0;
+      const maxRetryAttempts = 5;
 
-          if (data.error) {
-            throw new Error(data.error.message || JSON.stringify(data.error));
-          }
-
-          const parts = data.candidates?.[0]?.content?.parts || [];
-          const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
-          const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
-
-          if (functionCalls.length === 0) {
-            if (!forcedActionRetry && hasActionIntent(userText)) {
-              forcedActionRetry = true;
-              contents.push({ role: "model", parts: [{ text: textReply }] });
-              contents.push({
-                role: "user",
-                parts: [{
-                  text: "You replied with text instead of calling a tool, but this request needs a real action. If one of your tools actually does this, call it now instead of describing it.",
-                }],
-              });
-              continue;
-            }
-            return textReply || "I processed your request but have no response.";
-          }
-
-          if (!checkinTimer) {
-            checkinTimer = setInterval(() => {
-              bot.sendMessage(CHAT_ID, `🔄 වැඩේ දිගටම යනවා — දැන් කරන්නේ: ${currentStepLabel}`)
-                .catch((e) => {});
-            }, CHECKIN_INTERVAL_MS);
-          }
-          currentStepLabel = functionCalls.map((fc) => fc.name).join(", ");
-
-          contents.push({ role: "model", parts });
-          const responseParts = [];
-          let hitConfirmation = false;
-          for (const fc of functionCalls) {
-            const lineIdx = statusLines.length;
-            statusLines.push(toNarrativeLine(fc, "start"));
-            await renderStatus();
-            let result;
-            let toolSuccess = false;
-            let attemptCount = 0;
-            const maxToolAttempts = 5;
-            while (!toolSuccess && attemptCount < maxToolAttempts) {
-              attemptCount++;
-              result = await executeFunctionCall(fc);
-              if (result && !result.error && !Object.values(result).includes(false)) {
-                toolSuccess = true;
-              } else if (attemptCount < maxToolAttempts) {
-                await new Promise(r => setTimeout(r, 1000 * attemptCount));
+      while (attemptLoopCount < maxRetryAttempts) {
+        attemptLoopCount++;
+        try {
+          let stepFailed = false;
+          let failureReason = "";
+          for (let i = 0; i < MAX_TOOL_ROUNDS; i++) {
+            let data;
+            let geminiOk = false;
+            for (let attempt = 0; attempt < 3 && !geminiOk; attempt++) {
+              try {
+                data = await callGemini(contents, systemInstruction);
+                geminiOk = true;
+              } catch (e) {
+                if (attempt < 2) await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
               }
             }
-            statusLines[lineIdx] = toNarrativeLine(fc, "done", result);
-            await renderStatus();
-            if (result && result.status === "pending_confirmation") hitConfirmation = true;
-            if (fc.name === "create_task_list" && result && result.created) goalRegistered = true;
-            responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
-          }
-          contents.push({ role: "user", parts: responseParts });
+            if (!geminiOk) {
+              throw new Error("Gemini unreachable");
+            }
 
-          if (hitConfirmation) {
-            await sendConfirmationButtons();
-            return "⏸️ Waiting for your confirmation — tap the button above before I continue.";
+            if (data.error) {
+              throw new Error(data.error.message || JSON.stringify(data.error));
+            }
+
+            const parts = data.candidates?.[0]?.content?.parts || [];
+            const functionCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
+            const textReply = parts.filter((p) => p.text).map((p) => p.text).join(" ").trim();
+
+            if (functionCalls.length === 0) {
+              if (!forcedActionRetry && hasActionIntent(userText)) {
+                forcedActionRetry = true;
+                contents.push({ role: "model", parts: [{ text: textReply }] });
+                contents.push({
+                  role: "user",
+                  parts: [{
+                    text: "You replied with text instead of calling a tool, but this request needs a real action. If one of your tools actually does this, call it now instead of describing it.",
+                  }],
+                });
+                continue;
+              }
+              statusDone = true;
+              await renderStatus();
+              return textReply || "I processed your request but have no response.";
+            }
+
+            if (!checkinTimer) {
+              checkinTimer = setInterval(() => {
+                bot.sendMessage(CHAT_ID, `🔄 වැඩේ දිගටම යනවා — දැන් කරන්නේ: ${currentStepLabel}`)
+                  .catch((e) => {});
+              }, CHECKIN_INTERVAL_MS);
+            }
+            currentStepLabel = functionCalls.map((fc) => fc.name).join(", ");
+
+            contents.push({ role: "model", parts });
+            const responseParts = [];
+            let hitConfirmation = false;
+            for (const fc of functionCalls) {
+              const lineIdx = statusLines.length;
+              statusLines.push(toNarrativeLine(fc, "start"));
+              await renderStatus();
+              let result;
+              let toolSuccess = false;
+              let attemptCount = 0;
+              const maxToolAttempts = 3;
+              while (!toolSuccess && attemptCount < maxToolAttempts) {
+                attemptCount++;
+                result = await executeFunctionCall(fc);
+                if (result && !result.error && !Object.values(result).includes(false)) {
+                  toolSuccess = true;
+                } else {
+                  failureReason = result?.reason || result?.message || "Tool execution failed";
+                  if (attemptCount < maxToolAttempts) {
+                    await new Promise(r => setTimeout(r, 1000 * attemptCount));
+                  }
+                }
+              }
+              statusLines[lineIdx] = toNarrativeLine(fc, "done", result);
+              await renderStatus();
+              if (!toolSuccess) {
+                stepFailed = true;
+              }
+              if (result && result.status === "pending_confirmation") hitConfirmation = true;
+              if (fc.name === "create_task_list" && result && result.created) goalRegistered = true;
+              responseParts.push({ functionResponse: { name: fc.name, response: { result } } });
+            }
+            contents.push({ role: "user", parts: responseParts });
+
+            if (hitConfirmation) {
+              await sendConfirmationButtons();
+              statusDone = true;
+              await renderStatus();
+              return "⏸️ Waiting for your confirmation — tap the button above before I continue.";
+            }
+
+            if (stepFailed) {
+              break;
+            }
           }
-        }
-        return "මෙහෙයුම සම්පූර්ණයි බොස්.";
-      } finally {
-        if (checkinTimer) clearInterval(checkinTimer);
-        if (statusMsgId !== null) {
-          statusDone = true;
-          await renderStatus();
+
+          if (stepFailed) {
+            if (attemptLoopCount < maxRetryAttempts) {
+              statusLines.push(`⚠️ උත්සාහය ${attemptLoopCount} අසාර්ථකයි. වෙනස් විදිහකට ආයෙත් ට්‍රයි කරනවා (${attemptLoopCount + 1}/${maxRetryAttempts})...`);
+              await renderStatus();
+              contents.push({
+                role: "user",
+                parts: [{ text: `The previous approach failed with reason: "${failureReason}". Please try the task again using a completely different method or alternative approach.` }]
+              });
+              continue;
+            } else {
+              statusDone = true;
+              await renderStatus();
+              return `⚠️ මම උත්සාහයන් ${maxRetryAttempts}ක්ම වෙනස් විදිහට කරලා බැලුවා, නමුත් වැඩේ සාර්ථක කරගන්න බැරි වුණා බොස්. හේතුව: ${failureReason}`;
+            }
+          } else {
+            statusDone = true;
+            await renderStatus();
+            return "මෙහෙයුම සම්පූර්ණයි බොස්.";
+          }
+        } catch (e) {
+          if (attemptLoopCount >= maxRetryAttempts) {
+            statusDone = true;
+            await renderStatus();
+            return `⚠️ දෝෂයක් මතු වුණා සහ උත්සාහයන් ${maxRetryAttempts}ක්ම අසාර්ථකයි බොස්: ${e.message}`;
+          }
         }
       }
     } catch (e) {
