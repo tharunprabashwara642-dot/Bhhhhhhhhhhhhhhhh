@@ -296,6 +296,92 @@ async function sendLongMessage(chatId, text, options = {}) {
   }
 }
 
+async function generate_professional_word_doc_impl(args, ctx) {
+    const fs = require('fs');
+    const { Document, Packer, Paragraph, Table, TableCell, TableRow, WidthType, ShadingType, AlignmentType, TextRun, HeadingLevel, BorderStyle } = require('docx');
+
+    const doc = new Document({
+        sections: [{
+            properties: {},
+            children: [
+                new Paragraph({
+                    text: "AL ICT Intensive Master Plan & Revision Guide",
+                    heading: HeadingLevel.TITLE,
+                    alignment: AlignmentType.CENTER,
+                    spacing: { after: 300 }
+                }),
+                new Paragraph({
+                    text: "Prepared specially for Tharun Prabhashwara — Professional Exam Study Plan",
+                    alignment: AlignmentType.CENTER,
+                    spacing: { after: 400 }
+                }),
+                new Paragraph({
+                    text: "1. Unit-wise Weightage & Focus Areas",
+                    heading: HeadingLevel.HEADING_1,
+                    spacing: { before: 200, after: 100 }
+                }),
+                new Table({
+                    rows: [
+                        new TableRow({
+                            children: [
+                                new TableCell({
+                                    children: [new Paragraph({ children: [new TextRun({ text: "Unit / Subject Area", bold: true, color: "FFFFFF" })] })],
+                                    shading: { fill: "D35400", type: ShadingType.CLEAR, color: "auto" }
+                                }),
+                                new TableCell({
+                                    children: [new Paragraph({ children: [new TextRun({ text: "Estimated Marks", bold: true, color: "FFFFFF" })] })],
+                                    shading: { fill: "D35400", type: ShadingType.CLEAR, color: "auto" }
+                                }),
+                                new TableCell({
+                                    children: [new Paragraph({ children: [new TextRun({ text: "Priority Level", bold: true, color: "FFFFFF" })] })],
+                                    shading: { fill: "D35400", type: ShadingType.CLEAR, color: "auto" }
+                                })
+                            ]
+                        }),
+                        new TableRow({
+                            children: [
+                                new TableCell({ children: [new Paragraph("Programming & Python")] }),
+                                new TableCell({ children: [new Paragraph("25 - 30 Marks")] }),
+                                new TableCell({ children: [new Paragraph("High")] })
+                            ],
+                            shading: { fill: "FDF2E9", type: ShadingType.CLEAR, color: "auto" }
+                        }),
+                        new TableRow({
+                            children: [
+                                new TableCell({ children: [new Paragraph("Databases & SQL")] }),
+                                new TableCell({ children: [new Paragraph("20 - 25 Marks")] }),
+                                new TableCell({ children: [new Paragraph("High")] })
+                            ]
+                        }),
+                        new TableRow({
+                            children: [
+                                new TableCell({ children: [new Paragraph("Networking & OSI Model")] }),
+                                new TableCell({ children: [new Paragraph("15 - 20 Marks")] }),
+                                new TableCell({ children: [new Paragraph("Medium")] })
+                            ],
+                            shading: { fill: "FDF2E9", type: ShadingType.CLEAR, color: "auto" }
+                        })
+                    ],
+                    width: { size: 100, type: WidthType.PERCENTAGE }
+                }),
+                new Paragraph({
+                    text: "2. Exam Strategy & Quick Reference",
+                    heading: HeadingLevel.HEADING_1,
+                    spacing: { before: 300, after: 100 }
+                }),
+                new Paragraph({
+                    text: "• Practice past papers under timed conditions.\n• Master SQL Joins, Group By, and Subqueries.\n• Understand TCP/IP vs OSI layers thoroughly.",
+                    spacing: { after: 200 }
+                })
+            ]
+        }]
+    });
+
+    const buffer = await Packer.toBuffer(doc);
+    fs.writeFileSync('/tmp/AL_ICT_Study_Plan.docx', buffer);
+    return { success: true, path: '/tmp/AL_ICT_Study_Plan.docx', message: 'Professional Word document generated successfully!' };
+}
+
 // === SELF-CODE: NEW-CODE INSERTION POINT — insert_own_code adds new top-level code directly above this line. Do not remove or move this comment. ===
 
 // ============================================================
