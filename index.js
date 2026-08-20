@@ -2356,13 +2356,27 @@ async function editOwnCode(oldStr, newStr, commitMessage) {
 
   const firstIdx = content.indexOf(oldStr);
   if (firstIdx === -1) {
+    // Try normalized match
+    const normalize = (s) => s.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
+    const normalizedOld = normalize(oldStr);
+    const normalizedContent = normalize(content);
+    const looseIdx = normalizedOld ? normalizedContent.indexOf(normalizedOld) : -1;
+    if (looseIdx !== -1) {
+      // Find approximate position in original content by matching lines or substring
+      // If we can't reliably map back, try to locate the first few words of oldStr
+      const firstLine = oldStr.split("\n")[0].trim();
+      const approxIdx = firstLine ? content.indexOf(firstLine) : -1;
+      if (approxIdx !== -1) {
+        // Let's replace from approxIdx matching length of oldStr or similar
+        // Actually, let's just do a smarter replacement or fallback
+        console.log("Found loose normalized match for edit_own_code");
+      }
+    }
+    
     // Give the model something better than "try again" — a whitespace/
     // line-ending-insensitive search often finds the real spot even when
     // the exact bytes don't match, which is the single most common way a
     // model's copy of a long snippet drifts from the real source.
-    const normalize = (s) => s.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").trim();
-    const normalizedOld = normalize(oldStr);
-    const looseIdx = normalizedOld ? normalize(content).indexOf(normalizedOld) : -1;
     const hint = looseIdx !== -1
       ? " A near-match was found once whitespace/line-endings are ignored — the text is probably right but spacing, tabs, or line breaks differ from what you sent. Prefer a SHORT (1–3 line) snippet instead of a long block; short snippets are far less likely to have a transcription mismatch, and if you need to change several lines, do it as several small edit_own_code calls rather than one big old_str."
       : " No close match was found either — re-read the relevant section with read_own_code and copy old_str directly from that output rather than from memory.";
